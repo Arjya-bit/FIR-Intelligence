@@ -20,7 +20,7 @@ A hybrid NER pipeline extracts:
 ### Stage 3: Cross-FIR Pattern Detection
 This is where the real intelligence happens:
 
-1. **Fuzzy Name Matching** — Using RapidFuzz token_sort_ratio, the system matches accused persons across FIRs even when names are spelled differently or aliases are used. Threshold: 78% similarity.
+1. **Identity Resolution** — Union-find over recorded names and aliases makes offender links transitive. RapidFuzz `token_sort_ratio` (default threshold 82%) proposes candidate matches, but an approximate match is only accepted when corroborated by a shared father's name, alias, police station or district. Aliases never create an identity on their own: nicknames such as "Chhotu" or "Guddu" are shared by thousands of unrelated people, and treating one as an identifier chains the entire corpus into a single false offender.
 2. **Alias Resolution** — "Bablu alias Bhura" in one FIR is matched with "Bablu" in another, then with "Bhura" in a third.
 3. **MO Fingerprinting** — Crimes sharing the same approach method (e.g., "gas cutter on shutter + white Eeco van + CCTV removal") are linked as potential gang activity.
 4. **Network Detection** — Named entities like gang names ("Munna Bhai"), locations (Jamtara), and shared infrastructure (same phone numbers, same money trail) are used to identify organized crime networks.
@@ -37,7 +37,7 @@ The system generates:
 1. **Not just classification** — Most NLP tools stop at labeling. We go from raw text → entities → cross-FIR patterns → actionable intelligence.
 2. **Indian police FIR format awareness** — Our extractors understand "S/o", "R/o", "W/o", IPC section formats, Indian naming conventions, and CCTNS FIR structure.
 3. **Fuzzy matching, not exact** — Real offenders use aliases, misspell names, and cross jurisdictions. Our system handles this through token-level fuzzy matching.
-4. **Genuine IBM Bob integration** — Not a wrapper. The MCP server exposes 6 tools that Bob can call natively for conversational intelligence querying.
+4. **Genuine IBM Bob integration** — Not a wrapper. The MCP server exposes 8 tools that Bob can call natively, and imports the same analysis modules the API uses, so Bob and the dashboard never disagree about the corpus.
 5. **Works without API keys** — The system has a full rule-based fallback, making it runnable anywhere without cloud dependencies.
 
 ## User Experience

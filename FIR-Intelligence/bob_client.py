@@ -1,5 +1,19 @@
-import os
+"""IBM watsonx.ai client with a deterministic, data-driven fallback.
+
+When ``WATSONX_API_KEY`` is set, crime classification, chat and report writing
+go to a Granite model. When it is absent — or the call fails — the same
+questions are answered from the analysed corpus by :mod:`intel_qa` rather than
+from canned prose, so an unconfigured deployment degrades to *fewer* words, not
+to invented ones.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
+import os
+import time
+
 import httpx
 from dotenv import load_dotenv
 
@@ -8,38 +22,61 @@ load_dotenv()
 WATSONX_API_KEY = os.getenv("WATSONX_API_KEY", "")
 WATSONX_PROJECT_ID = os.getenv("WATSONX_PROJECT_ID", "")
 WATSONX_URL = os.getenv("WATSONX_URL", "https://us-south.ml.cloud.ibm.com")
+WATSONX_MODEL = os.getenv("WATSONX_MODEL", "ibm/granite-3-8b-instruct")
+REQUEST_TIMEOUT = float(os.getenv("WATSONX_TIMEOUT", "60"))
 
-_iam_token: str | None = None
+#: IBM IAM access tokens are valid for one hour. The previous implementation
+#: cached the first token forever, so every deployment started failing with
+#: 401s roughly an hour after boot. Refresh a minute before expiry.
+_TOKEN_SKEW_SECONDS = 60
+
+_token: str | None = None
+_token_expires_at: float = 0.0
+_token_lock = asyncio.Lock()
+
+
+def is_configured() -> bool:
+    """True when watsonx.ai credentials are present."""
+    return bool(WATSONX_API_KEY and WATSONX_PROJECT_ID)
+
+
+class WatsonxError(RuntimeError):
+    """Raised when watsonx.ai cannot fulfil a request."""
 
 
 async def _get_iam_token() -> str:
-    global _iam_token
-    if _iam_token:
-        return _iam_token
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://iam.cloud.ibm.com/identity/token",
-            data={
-                "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
-                "apikey": WATSONX_API_KEY,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp.raise_for_status()
-        _iam_token = resp.json()["access_token"]
-        return _iam_token
+    global _token, _token_expires_at
+
+    async with _token_lock:
+        if _token and time.monotonic() < _token_expires_at:
+            return _token
+
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.post(
+                "https://iam.cloud.ibm.com/identity/token",
+                data={
+                    "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
+                    "apikey": WATSONX_API_KEY,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+
+        _token = payload["access_token"]
+        lifetime = int(payload.get("expires_in", 3600))
+        _token_expires_at = time.monotonic() + max(lifetime - _TOKEN_SKEW_SECONDS, 60)
+        return _token
 
 
-async def generate(prompt: str, model_id: str = "ibm/granite-3-8b-instruct",
+async def generate(prompt: str, model_id: str | None = None,
                    max_tokens: int = 2048, temperature: float = 0.1) -> str:
-    if not WATSONX_API_KEY:
-        return _fallback_generate(prompt)
-
-    token = await _get_iam_token()
-    url = f"{WATSONX_URL}/ml/v1/text/generation?version=2024-05-31"
+    """Call watsonx.ai text generation. Raises :class:`WatsonxError` on failure."""
+    if not is_configured():
+        raise WatsonxError("watsonx.ai credentials are not configured")
 
     payload = {
-        "model_id": model_id,
+        "model_id": model_id or WATSONX_MODEL,
         "input": prompt,
         "parameters": {
             "max_new_tokens": max_tokens,
@@ -51,188 +88,106 @@ async def generate(prompt: str, model_id: str = "ibm/granite-3-8b-instruct",
         "project_id": WATSONX_PROJECT_ID,
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        resp.raise_for_status()
-        result = resp.json()
-        return result["results"][0]["generated_text"].strip()
+    try:
+        token = await _get_iam_token()
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            resp = await client.post(
+                f"{WATSONX_URL}/ml/v1/text/generation?version=2024-05-31",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results") or []
+    except httpx.HTTPStatusError as exc:
+        raise WatsonxError(
+            f"watsonx.ai returned {exc.response.status_code}: "
+            f"{exc.response.text[:200]}"
+        ) from exc
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        raise WatsonxError(f"watsonx.ai request failed: {exc}") from exc
+
+    if not results:
+        raise WatsonxError("watsonx.ai returned no completions")
+    return (results[0].get("generated_text") or "").strip()
 
 
-def _fallback_generate(prompt: str) -> str:
-    """Rule-based fallback when watsonx.ai is not configured."""
-    if "classify" in prompt.lower() or "crime type" in prompt.lower():
-        return _classify_fallback(prompt)
-    if "extract" in prompt.lower() or "entities" in prompt.lower():
-        return _extract_fallback(prompt)
-    if "summary" in prompt.lower() or "report" in prompt.lower():
-        return _report_fallback(prompt)
-    if "chat" in prompt.lower() or "question" in prompt.lower():
-        return _chat_fallback(prompt)
-    return "Analysis complete."
+# ── Rule-based crime classification ────────────────────────────────────────
+
+#: Ordered most-specific first: a narrative mentioning both a weapon and a
+#: death should classify as murder, not assault.
+_CLASSIFIER_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("murder", ("murder", "killed", "found dead", "stab wound", "302 ipc",
+                "post-mortem", "deceased")),
+    ("dacoity", ("dacoity", "395 ipc", "396 ipc", "gang of", "at gunpoint, looted")),
+    ("kidnapping", ("kidnap", "abduct", "missing person", "did not return",
+                    "363 ipc", "366 ipc", "ransom")),
+    ("sexual_offense", ("376 ipc", "354 ipc", "pocso", "molest", "rape")),
+    ("drug_offense", ("ndps", "heroin", "smack", "ganja", "mdma", "brown sugar",
+                      "narcotic", "charas")),
+    ("extortion", ("extortion", "protection money", "384 ipc", "385 ipc",
+                   "threatening call")),
+    ("cybercrime", ("cyber", "otp", "kyc", "phishing", "digital arrest",
+                    "66c", "66d", "fake profile", "online fraud")),
+    ("robbery", ("robbery", "snatch", "looted", "392 ipc", "394 ipc", "397 ipc",
+                 "bike-borne")),
+    ("burglary", ("burgl", "broke into", "break-in", "gas cutter", "457 ipc",
+                  "cutting the lock", "shutter")),
+    ("arson", ("arson", "set on fire", "435 ipc", "436 ipc", "inflammable")),
+    ("rioting", ("riot", "147 ipc", "148 ipc", "149 ipc", "mob", "group clash")),
+    ("fraud", ("fraud", "cheated", "forged", "420 ipc", "ponzi", "fake investment")),
+    ("assault", ("assault", "attacked", "beaten", "323 ipc", "324 ipc", "307 ipc",
+                 "injuries", "hospitalized")),
+    ("theft", ("theft", "stolen", "pickpocket", "379 ipc", "380 ipc")),
+]
 
 
-def _classify_fallback(prompt: str) -> str:
-    text = prompt.lower()
-    if any(w in text for w in ["murder", "killed", "stab", "dead", "302"]):
-        return "murder"
-    if any(w in text for w in ["snatch", "rob", "loot", "dacoit", "392", "395", "397"]):
-        return "robbery"
-    if any(w in text for w in ["burgl", "broke into", "break-in", "457", "380"]):
-        return "burglary"
-    if any(w in text for w in ["fraud", "cheat", "scam", "phish", "420", "66c", "66d"]):
-        return "fraud"
-    if any(w in text for w in ["drug", "ndps", "ganja", "heroin", "smack", "mdma"]):
-        return "drug_offense"
-    if any(w in text for w in ["kidnap", "missing", "abduct", "363", "366", "pocso"]):
-        return "kidnapping"
-    if any(w in text for w in ["extort", "threat", "protection money", "384", "506"]):
-        return "extortion"
-    if any(w in text for w in ["cyber", "stalk", "identity theft", "fake profile"]):
-        return "cybercrime"
-    if any(w in text for w in ["assault", "beat", "attack", "injur", "323", "307"]):
-        return "assault"
-    if any(w in text for w in ["arson", "fire", "burn", "435", "436"]):
-        return "arson"
+def classify_crime_rule_based(fir_text: str) -> str:
+    text = (fir_text or "").lower()
+    for crime_type, keywords in _CLASSIFIER_RULES:
+        if any(keyword in text for keyword in keywords):
+            return crime_type
     return "other"
 
 
-def _extract_fallback(prompt: str) -> str:
-    return json.dumps({"status": "extracted_via_spacy"})
-
-
-def _report_fallback(prompt: str) -> str:
-    return """UTTAR PRADESH POLICE - CRIME INTELLIGENCE REPORT
-Generated by FIR Intelligence System (Bob AI / IBM Granite 3)
-
-1. EXECUTIVE SUMMARY
-Analysis of FIR data across multiple UP districts reveals organized crime networks operating in theft/robbery, cyber fraud, drug trafficking, and extortion. Key patterns include the Bablu Chain Snatching Gang (Lucknow), Jamtara Cyber Fraud Network (cross-state), Nepal Border Drug Supply Chain, Munna Bhai Extortion Racket (Varanasi-Prayagraj), and Kanpur Commercial Burglary Ring.
-
-2. CRIME PATTERN ANALYSIS
-- Robbery/Snatching: Concentrated in Lucknow (Charbagh-Hazratganj corridor), bike-borne attacks targeting lone pedestrians between 2100-0000 hours
-- Cyber Fraud: Jamtara-based network using 'Vikram Sharma' alias, KYC-expiry phishing and digital arrest scams, Rs. 2+ crore defrauded across UP
-- Drug Trafficking: Nepal-Gorakhpur-Lucknow-Meerut supply chain, heroin/MDMA distribution network
-- Extortion: 'Munna Bhai' brand used for systematic extortion of businesses in Varanasi and Prayagraj tourist areas
-- Commercial Burglary: Kanpur-based gang using gas cutters, targeting commercial establishments with white Eeco van
-
-3. REPEAT OFFENDER ALERTS
-- Bablu alias Bhura: 4+ FIRs in Lucknow, chain snatching specialist, operates on Pulsar motorcycle
-- Vikram Sharma (alias): Jamtara cyber fraud network, 3+ districts affected, Rs. 2+ crore total fraud
-- Chhote Lal alias Chhotu: Armed robbery/dacoity in Gorakhpur, escalating violence pattern
-- Munna alias Mohammad Shahid: Extortion gang leader, 12 prior cases, cross-district operations
-- Shakeel Ahmed alias Kalu: Drug kingpin, 7 prior NDPS cases, heads Nepal border supply chain
-
-4. STATION-WISE TREND ANALYSIS
-- Hazratganj PS (Lucknow): 2 FIRs - chain snatching hotspot
-- Charbagh PS (Lucknow): 2 FIRs - snatching near railway station
-- Lanka PS (Varanasi): 2 FIRs - extortion and robbery
-- Kotwali PS (Gorakhpur/Meerut): Multiple FIRs - drug seizure and fraud
-
-5. RECOMMENDED ACTIONS
-- Constitute inter-district task force for Munna Bhai extortion gang
-- Coordinate with Jharkhand Cyber Cell for Jamtara network takedown
-- Strengthen Nepal border surveillance for drug interdiction
-- Deploy dedicated surveillance on Kanpur burglary gang's white Eeco van
-- Issue lookout circulars for all identified repeat offenders
-
-6. RISK ASSESSMENT
-CRITICAL: Drug supply chain (Nepal-Gorakhpur-Lucknow-Meerut) - large-scale heroin trafficking
-HIGH: Munna Bhai extortion racket - expanding territorial reach with violent escalation
-HIGH: Jamtara cyber fraud network - cross-state, high financial impact
-MEDIUM: Bablu snatching gang - localized but persistent
-MEDIUM: Kanpur burglary ring - organized, professional, escalating target values"""
-
-
-def _chat_fallback(prompt: str) -> str:
-    text = prompt.lower()
-
-    if any(w in text for w in ["repeat offender", "habitual", "serial"]):
-        return ("Based on FIR intelligence, key repeat offenders identified:\n\n"
-                "1. Bablu alias Bhura (CRITICAL): 4+ FIRs in Lucknow - chain snatching specialist\n"
-                "2. Chhote Lal alias Chhotu (HIGH): Armed robbery/dacoity in Gorakhpur\n"
-                "3. Shakeel Ahmed alias Kalu (CRITICAL): Drug kingpin, 7+ prior NDPS cases\n"
-                "4. Raju alias Chhotu (HIGH): Kidnapping of minors in Agra\n"
-                "5. 'Vikram Sharma' network alias: Jamtara cyber fraud, Rs. 2+ crore fraud across UP")
-
-    if any(w in text for w in ["pattern", "trend", "top crime"]):
-        return ("Key crime patterns detected:\n\n"
-                "- Robbery/Snatching highest in Lucknow (Charbagh-Hazratganj corridor)\n"
-                "- Commercial burglary concentrated in Kanpur (gas cutter MO)\n"
-                "- Cyber fraud cross-district, originating from Jamtara network\n"
-                "- Drug trafficking via Nepal border supply chain\n"
-                "- Extortion racket expanding in Varanasi-Prayagraj\n\n"
-                "Temporal patterns: snatching peaks 2100-0000hrs, burglaries 0100-0400hrs")
-
-    if any(w in text for w in ["district", "highest", "crime rate"]):
-        return ("District-wise analysis:\n"
-                "1. Lucknow: 6 FIRs - highest caseload (snatching, drugs)\n"
-                "2. Kanpur: 4 FIRs - commercial burglary ring\n"
-                "3. Varanasi: 4 FIRs - extortion, drugs, murder\n"
-                "4. Agra: 3 FIRs - cyber fraud, kidnapping\n"
-                "5. Gorakhpur: 3 FIRs - armed crime, drug transit\n"
-                "6. Prayagraj: 2 FIRs - extortion racket\n"
-                "7. Meerut: 2 FIRs - drugs, cyber fraud")
-
-    if any(w in text for w in ["bablu", "snatch", "chain"]):
-        return ("Bablu alias Bhura - Criminal Profile:\n"
-                "Risk: CRITICAL | Area: Lucknow Charbagh-Hazratganj corridor\n"
-                "Linked FIRs: LC/001, LC/002, LC/013, LC/022\n"
-                "MO: Bike-borne (black Pulsar), knife attack, targets lone pedestrians 2100-0000hrs\n"
-                "Associates: Sunny (accomplice), Deepak alias Deepu (drug connection)\n"
-                "Total estimated cases: 15+ in 6 months")
-
-    if any(w in text for w in ["cyber", "fraud", "jamtara", "vikram"]):
-        return ("Jamtara Cyber Fraud Network:\n"
-                "Alias: 'Vikram Sharma' | Base: Jamtara, Jharkhand\n"
-                "UP FIRs: AG/005, GK/010, MR/019, AG/025\n"
-                "Total fraud: Rs. 2+ crore across UP\n"
-                "Methods: KYC-expiry phishing, investment fraud, digital arrest scam\n"
-                "Money trail: 8 mule accounts routing to Jharkhand")
-
-    if any(w in text for w in ["drug", "ndps", "nepal", "heroin"]):
-        return ("Nepal Border Drug Supply Network:\n"
-                "Route: Nepal > Gorakhpur > Lucknow > Meerut\n"
-                "Key arrests: Shakeel (kingpin, 15kg heroin), Guddu Khan, Sunny Yadav\n"
-                "FIRs: VN/008, MR/014, LC/020\n"
-                "Major seizure: 15kg heroin worth Rs. 30 crore (Meerut)")
-
-    return ("Based on the FIR intelligence database (25 FIRs, 7 districts):\n"
-            "- 5 organized crime networks identified\n"
-            "- Multiple repeat offenders flagged\n"
-            "- Robbery and burglary most prevalent\n"
-            "- Lucknow has highest case concentration\n\n"
-            "Ask about specific offenders, crime patterns, districts, or networks for details.")
+VALID_CRIME_TYPES = {
+    "theft", "robbery", "burglary", "assault", "murder", "fraud", "cybercrime",
+    "drug_offense", "kidnapping", "sexual_offense", "extortion", "dacoity",
+    "arson", "rioting", "other",
+}
 
 
 async def classify_crime(fir_text: str) -> str:
-    if not WATSONX_API_KEY:
-        return _classify_fallback(fir_text)
+    """Classify an FIR, preferring watsonx.ai and falling back to rules."""
+    if not is_configured():
+        return classify_crime_rule_based(fir_text)
 
     prompt = f"""You are an expert Indian police crime analyst. Classify the following FIR into exactly one crime type.
 
-Crime types: theft, robbery, burglary, assault, murder, fraud, cybercrime, drug_offense, kidnapping, sexual_offense, extortion, dacoity, arson, rioting, other
+Crime types: {', '.join(sorted(VALID_CRIME_TYPES))}
 
 FIR Text:
 {fir_text[:2000]}
 
 Respond with ONLY the crime type (single word from the list above):"""
 
-    result = await generate(prompt, max_tokens=20, temperature=0.0)
-    valid = {"theft", "robbery", "burglary", "assault", "murder", "fraud",
-             "cybercrime", "drug_offense", "kidnapping", "sexual_offense",
-             "extortion", "dacoity", "arson", "rioting", "other"}
-    cleaned = result.strip().lower().replace('"', '').replace("'", "")
-    return cleaned if cleaned in valid else _classify_fallback(fir_text)
+    try:
+        result = await generate(prompt, max_tokens=20, temperature=0.0)
+    except WatsonxError:
+        return classify_crime_rule_based(fir_text)
+
+    cleaned = result.strip().lower().strip('"\'.,')
+    return cleaned if cleaned in VALID_CRIME_TYPES else classify_crime_rule_based(fir_text)
 
 
 async def extract_entities_llm(fir_text: str) -> dict:
+    """Best-effort LLM entity extraction. Returns ``{}`` when unavailable."""
+    if not is_configured():
+        return {}
+
     prompt = f"""You are an expert NLP system for Indian police FIR analysis. Extract all named entities from this FIR.
 
 FIR Text:
@@ -251,50 +206,78 @@ Return a JSON object with these keys:
 
 JSON:"""
 
-    result = await generate(prompt, max_tokens=1500, temperature=0.0)
     try:
-        start = result.find("{")
-        end = result.rfind("}") + 1
+        result = await generate(prompt, max_tokens=1500, temperature=0.0)
+        start, end = result.find("{"), result.rfind("}") + 1
         if start >= 0 and end > start:
-            return json.loads(result[start:end])
-    except (json.JSONDecodeError, ValueError):
+            parsed = json.loads(result[start:end])
+            return parsed if isinstance(parsed, dict) else {}
+    except (WatsonxError, json.JSONDecodeError, ValueError):
         pass
     return {}
 
 
-async def generate_intelligence_report(analysis_data: dict) -> str:
-    prompt = f"""You are a senior intelligence officer of Uttar Pradesh Police. Generate a comprehensive crime intelligence report based on the following analysis data.
+async def generate_intelligence_report(analysis_data: dict, *,
+                                       deterministic_report: str = "") -> str:
+    """Produce an intelligence report.
 
-Analysis Summary:
-- Total FIRs analyzed: {analysis_data.get('total_firs', 0)}
+    ``deterministic_report`` is the report computed from the corpus. It is
+    returned as-is when watsonx.ai is unavailable, and supplied to the model as
+    grounding when it is, so the narrative cannot drift from the real figures.
+    """
+    if not is_configured():
+        return deterministic_report
+
+    prompt = f"""You are a senior intelligence officer of Uttar Pradesh Police. Rewrite the following verified analysis into a polished crime intelligence report.
+
+Use ONLY the facts below. Do not invent offenders, FIR numbers, districts or figures.
+
+Verified analysis:
+{deterministic_report[:6000]}
+
+Supporting totals:
+- Total FIRs analysed: {analysis_data.get('total_firs', 0)}
 - Crime breakdown: {json.dumps(analysis_data.get('crime_breakdown', {}))}
 - Repeat offenders found: {analysis_data.get('repeat_offender_count', 0)}
 - Districts covered: {json.dumps(analysis_data.get('districts', []))}
-- Key patterns: {json.dumps(analysis_data.get('patterns', []))}
+- Networks: {json.dumps(analysis_data.get('patterns', []))}
 
-Generate a structured intelligence report with:
-1. Executive Summary
-2. Crime Pattern Analysis
-3. Repeat Offender Alerts
-4. Station-wise Trend Analysis
-5. Recommended Actions
-6. Risk Assessment
+Keep the section structure (Executive Summary, Crime Pattern Analysis, Repeat
+Offender Alerts, Organised Networks, Station-wise Trend Analysis, Recommended
+Actions, Risk Assessment).
 
 Report:"""
 
-    return await generate(prompt, max_tokens=2048, temperature=0.3)
+    try:
+        return await generate(prompt, max_tokens=2048, temperature=0.3)
+    except WatsonxError:
+        return deterministic_report
 
 
-async def chat_with_bob(message: str, context: str = "") -> str:
-    prompt = f"""You are Bob, an AI-powered FIR Intelligence Assistant deployed for Uttar Pradesh Police. You help officers analyze FIR data, identify crime patterns, and track repeat offenders.
+async def chat_with_bob(message: str, context: str = "", *,
+                        deterministic_answer: str = "") -> str:
+    """Answer an officer's question, grounded in the analysed corpus."""
+    if not is_configured():
+        return deterministic_answer
 
-Context from FIR database:
+    prompt = f"""You are Bob, an AI-powered FIR Intelligence Assistant deployed for Uttar Pradesh Police. You help officers analyse FIR data, identify crime patterns, and track repeat offenders.
+
+Answer using ONLY the facts below. If they do not cover the question, say so —
+never invent FIR numbers, offender names or statistics.
+
+Corpus summary:
 {context[:3000]}
+
+Pre-computed answer from the database (authoritative):
+{deterministic_answer[:3000]}
 
 Officer's question: {message}
 
-Provide a helpful, specific response based on the FIR data. Reference specific FIR numbers, accused names, and patterns when relevant.
+Give a clear, specific answer. Reference the FIR numbers and names that appear above.
 
 Response:"""
 
-    return await generate(prompt, max_tokens=1024, temperature=0.3)
+    try:
+        return await generate(prompt, max_tokens=1024, temperature=0.3)
+    except WatsonxError:
+        return deterministic_answer

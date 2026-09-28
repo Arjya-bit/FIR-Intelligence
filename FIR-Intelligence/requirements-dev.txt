@@ -1,0 +1,6 @@
+# Test and development dependencies (install alongside requirements.txt).
+-r requirements.txt
+
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1        # also used by the app; TestClient needs it explicitly

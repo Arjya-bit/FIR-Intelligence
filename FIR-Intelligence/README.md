@@ -2,7 +2,9 @@
 
 **IBM Bob AI Hackathon · NFSU | Track 4: AI & Predictive | Problem Statement 10**
 
-> A Bob-powered NLP intelligence tool that ingests FIR text samples, categorizes crime types, extracts named entities, detects repeat offenders, and generates station-level crime intelligence reports.
+> An NLP intelligence platform that ingests FIR text, classifies crime types, extracts named
+> entities, resolves offender identities across jurisdictions, detects organised crime
+> networks, and produces station-level intelligence reports.
 
 ---
 
@@ -14,87 +16,165 @@
 
 ## Problem Statement
 
-UP Police's CCTNS system holds **3+ crore digitized FIRs** with no NLP layer. Serial offenders like the Jamtara gang evaded detection for years because inter-district FIR connections were never surfaced. Pattern analysis is **entirely manual** — officers have no automated way to detect repeat offenders, cross-reference modus operandi across jurisdictions, or identify organized crime networks spanning multiple districts.
+CCTNS holds 3+ crore digitised FIRs with no NLP layer on top. Serial offenders evade
+detection because inter-district FIR connections are never surfaced, and pattern analysis
+is entirely manual — officers have no automated way to detect repeat offenders,
+cross-reference modus operandi across jurisdictions, or identify organised crime networks
+spanning multiple districts.
 
-## Solution
+## Quick start
 
-A full-stack NLP intelligence platform powered by **IBM Bob AI** and **watsonx.ai Granite models** that:
+No database, no API key, no build step:
 
-1. **Ingests** batch FIR text samples (25 realistic FIRs across 7 UP districts)
-2. **Classifies** each FIR by crime type using IBM watsonx.ai Granite 3
-3. **Extracts** named entities — accused persons, victims, locations, weapons, vehicles, IPC sections, and modus operandi patterns
-4. **Detects** repeat offenders through fuzzy name matching, alias resolution, and MO fingerprinting
-5. **Identifies** organized crime networks (Jamtara cyber fraud, Bablu snatching gang, Kanpur burglary ring, Munna Bhai extortion racket, Nepal border drug supply chain)
-6. **Generates** station-level crime trend summaries with risk assessments and actionable intelligence reports
-
-## Key Features
-
-- **Hybrid NLP Pipeline** — IBM watsonx.ai LLM + deterministic regex extraction for robust entity recognition
-- **Cross-FIR Pattern Detection** — Fuzzy name matching (RapidFuzz) + MO fingerprinting identifies repeat offenders across districts
-- **5 Crime Networks Detected** — Automated cross-FIR correlation surfaces organized crime operations
-- **Interactive Dashboard** — React-based UI with crime charts, network graphs, offender profiles, and station analysis
-- **Bob AI Chat** — Natural language querying of the entire FIR intelligence database
-- **MCP Server** — 6 tools exposed for genuine IBM Bob CLI integration via Model Context Protocol
-- **Intelligence Reports** — Downloadable crime trend summaries with recommended enforcement actions
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| AI/NLP | IBM watsonx.ai (Granite 3 8B Instruct) |
-| Agent Interface | IBM Bob CLI via MCP |
-| Backend | Python, FastAPI, RapidFuzz, Pydantic |
-| Frontend | React 18, Vite, Tailwind CSS, Recharts |
-| Data Processing | Pandas, scikit-learn, NetworkX |
-
-## How to Run
-
-### Prerequisites
-- Python 3.11+
-- Node.js 18+
-- IBM Cloud account with watsonx.ai access (optional — works with rule-based fallback)
-
-### Backend
 ```bash
-cd src/backend
 pip install -r requirements.txt
-cp ../.env.example .env  # Edit with your watsonx.ai credentials (optional)
 python main.py
 ```
 
-### Frontend
-```bash
-cd src/frontend
-npm install
-npm run dev
+Open <http://localhost:8000>. The service seeds an NCRB-shaped corpus of 100 FIRs, runs the
+analysis pipeline, and serves the dashboard. Interactive API docs are at `/docs`.
+
+Optional configuration lives in `.env` (`cp .env.example .env`) — watsonx.ai credentials,
+MongoDB, seed size, matching thresholds. **Everything is optional**: with nothing set the
+service runs on an in-memory store and answers from the rule-based engine.
+
+## What it does
+
+1. **Ingests** FIR records — the seeded corpus, or your own JSON batch via the *Ingest FIRs*
+   tab / `POST /api/upload-firs`.
+2. **Classifies** each FIR into one of 15 crime types (watsonx.ai Granite 3, with a keyword
+   classifier fallback).
+3. **Extracts** accused, victims, locations, weapons, vehicles, IPC sections, phone numbers
+   and modus operandi from the narrative text.
+4. **Resolves offender identities** across FIRs using union-find over names and aliases, so
+   links are transitive.
+5. **Detects organised networks** by clustering a weighted co-offending graph.
+6. **Reports** station-level trends, hotspots, risk assessments and recommended actions.
+
+### How identity resolution works
+
+Name matching in Indian FIRs is dangerous in two specific ways, and both are handled
+explicitly:
+
+- **Nicknames are not identifiers.** "Chhotu", "Guddu" and "Bablu" are shared by thousands
+  of unrelated people. An alias can *corroborate* a match but never create one — otherwise a
+  single shared nickname chains the whole corpus into one bogus offender.
+- **A fuzzy name match alone is not evidence.** An approximate match ("Sunil Yadav" vs
+  "Sunny Yadav") must be backed by a shared father's name, alias, police station or
+  district before two identities are merged. In a policing context a false link is worse
+  than a missed one.
+
+Networks are built by merging the strongest links first with a size cap, not by plain
+connected components — single-linkage over a common offence pattern chains unrelated cases
+into one meaningless cluster.
+
+Every finding is an automated correlation and is labelled as requiring verification by the
+investigating officer.
+
+## Architecture
+
+```
+main.py              FastAPI app — routes, lifespan, seeding
+database.py          Storage: MongoDB when reachable, in-memory otherwise
+nlp_engine.py        Pipeline: classify -> extract -> correlate
+entity_extractor.py  Regex NER tuned for Indian FIR conventions (S/o, R/o, IPC)
+pattern_detector.py  Identity resolution, station rollups, network clustering
+intel_qa.py          Deterministic Q&A and report writing over the analysis
+bob_client.py        watsonx.ai client + grounded fallbacks
+ncrb_seed.py         NCRB-distribution FIR corpus generator
+models.py            Pydantic schemas
+static/              Zero-build dashboard (app.jsx source, app.js compiled)
+src/mcp_server/      MCP server for IBM Bob CLI
+src/frontend/        Optional Vite + Tailwind React client
+tests/               pytest suite
 ```
 
-### Bob CLI (MCP Server)
+## API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/health` | Status, storage backend, model in use, corpus size |
+| `GET /api/filters` | Filter options for the UI |
+| `GET /api/dashboard` | Headline counts, breakdowns, trends, networks |
+| `GET /api/firs` | Paginated FIR list — `q`, `crime_type`, `district`, `station`, `severity`, `limit`, `offset` |
+| `GET /api/firs/{fir_number}` | Full record plus cross-FIR links |
+| `GET /api/repeat-offenders` | Flagged offenders — `risk_level`, `min_incidents` |
+| `GET /api/stations` | Station rollups with risk assessments |
+| `GET /api/networks` | Detected organised networks |
+| `GET /api/trends` | Month-by-crime-type series |
+| `GET /api/report` | Intelligence report + metadata |
+| `POST /api/chat` | Ask a question about the corpus |
+| `POST /api/upload-firs` | Ingest a JSON array of FIRs and re-analyse |
+
+`GET /api/firs` returns `{items, total, limit, offset, has_more}`.
+
+## Configuration
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `WATSONX_API_KEY` / `WATSONX_PROJECT_ID` | unset | Enables watsonx.ai; without them the rule-based engine is used |
+| `FIR_STORAGE` | `auto` | `auto` \| `memory` \| `mongodb` (fail if unreachable) |
+| `MONGO_URL` | `mongodb://localhost:27017` | Used when Mongo is reachable |
+| `FIR_SEED_SIZE` | `100` | FIRs generated on first boot |
+| `FIR_NAME_MATCH_THRESHOLD` | `82` | Token-similarity score for candidate name matches |
+| `FIR_HOST` / `FIR_PORT` | `127.0.0.1` / `8000` | Bind address (set host to `0.0.0.0` to expose) |
+| `FIR_CORS_ORIGINS` | unset | Comma-separated origins; enables credentialed CORS |
+
+See `.env.example` for the full list.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+110 tests cover identity resolution, entity extraction, the storage backend, the
+deterministic answerer, and every HTTP endpoint including error paths.
+
+## IBM Bob CLI (MCP)
+
 ```bash
 bob mcp add fir-intelligence -- python src/mcp_server/server.py
-bob chat  # Then use FIR intelligence tools
+bob chat
 ```
 
-Open http://localhost:5173 for the dashboard.
+Eight tools: `analyze_firs`, `get_repeat_offenders`, `get_station_summary`,
+`get_crime_networks`, `search_firs`, `get_fir`, `ask_intelligence`,
+`generate_intelligence_report`. The server imports the same modules the API uses, so Bob and
+the dashboard always describe the same corpus.
 
-See [docs/setup-guide.md](docs/setup-guide.md) for detailed instructions.
+## The dashboard
 
-## Demo
+`static/` ships precompiled and with its libraries vendored, so `python main.py` serves a
+working dashboard with no npm install and no CDN access — which matters on an isolated
+police network. After editing `static/app.jsx`:
 
-- **Video**: See `demo/demo-video-link.txt`
-- **Live Demo**: See `demo/live-demo-url.txt`
-- **Screenshots**: See `demo/screenshots/`
+```bash
+./scripts/build-ui.sh
+```
 
-## Known Limitations
+`src/frontend/` is an optional Vite + Tailwind client against the same API
+(`npm install && npm run dev`, proxying to port 8000).
 
-- Entity extraction accuracy varies with non-standard FIR formats
-- Repeat offender matching is name-based (no biometric/photo matching)
-- Batch-mode analysis (not real-time CCTNS streaming)
-- Geographic mapping uses district centroids
-- Falls back to rule-based processing without watsonx.ai credentials
+## Tech stack
 
-## What We're Most Proud Of
+| Component | Technology |
+|-----------|-----------|
+| AI/NLP | IBM watsonx.ai (Granite 3 8B Instruct), rule-based fallback |
+| Agent interface | IBM Bob CLI via MCP |
+| Backend | Python 3.11+, FastAPI, Pydantic, RapidFuzz |
+| Storage | MongoDB (Motor) — optional, in-memory fallback |
+| Dashboard | React 18 + Recharts, precompiled, no build step to run |
 
-1. **The 5 interconnected crime networks** — our 25 FIRs form a realistic web of cross-district criminal activity, and the system correctly identifies all 5 organized networks purely from NLP analysis
-2. **The MCP server** — genuine IBM Bob integration where Bob can query FIR intelligence, not just a wrapper
-3. **The repeat offender detection** — fuzzy matching + alias resolution catches offenders who use different names across districts (e.g., "Bablu alias Bhura" matched across 4 Lucknow FIRs)
+## Known limitations
+
+- Offender matching is name-based; no biometric or photograph matching. Two different people
+  with the same recorded full name will merge, which is inherent to the available data.
+- Entity extraction is tuned to conventional FIR phrasing (`Accused identified as`,
+  `Arrested: (1) …`, `S/o`, `R/o`). Free-form narratives extract less.
+- Batch analysis, not real-time CCTNS streaming.
+- Geographic mapping uses district centroids with jitter, not surveyed coordinates.
+- The seeded corpus is generated, not real FIR data.
+- No authentication — the API is open. Do not expose it beyond localhost without putting an
+  authenticating proxy in front of it.

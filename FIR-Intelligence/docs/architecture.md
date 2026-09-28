@@ -9,7 +9,7 @@ graph TD
         A -->|Terminal| C[IBM Bob CLI]
     end
 
-    subgraph "Frontend - React / Vite / Tailwind"
+    subgraph "Frontend - React + Recharts, precompiled"
         B --> D[Dashboard View]
         B --> E[FIR Records View]
         B --> F[Repeat Offenders View]
@@ -18,10 +18,11 @@ graph TD
         B --> I[Network Intelligence View]
         B --> J[Bob AI Chat Interface]
         B --> K[Intelligence Report View]
+        B --> K2[FIR Ingestion View]
     end
 
     subgraph "API Layer"
-        D & E & F & G & H & I & J & K -->|REST API| L[FastAPI Server :8000]
+        D & E & F & G & H & I & J & K & K2 -->|REST API| L[FastAPI Server :8000]
         C -->|MCP Protocol stdio| M[MCP Server]
     end
 
@@ -37,21 +38,25 @@ graph TD
         N -->|classify_crime| R[IBM watsonx.ai Granite 3 8B]
         O -->|extract_entities_llm| R
         Q -->|generate_report| R
-        N -.->|fallback| S[Rule-Based Classifier]
+        N -.->|fallback| S[Keyword Classifier]
+        Q -.->|fallback| S2[Deterministic Report Builder - intel_qa]
         O -->|hybrid| T[Regex + Pattern Extraction]
     end
 
     subgraph "Pattern Detection Engine"
-        P --> U[Fuzzy Name Matcher - RapidFuzz]
-        P --> V[Alias Resolution]
-        P --> W[MO Fingerprinting]
-        P --> X[Network Detector]
+        P --> U[Candidate Matcher - RapidFuzz]
+        U --> V[Corroboration Check - alias / father / station / district]
+        V --> W[Union-Find Identity Resolution]
+        W --> X[Weighted Co-offending Graph]
+        X --> X2[Capped Greedy Clustering - networks]
     end
 
     subgraph "Data Layer"
-        Y[(FIR JSON Data)] --> L
-        Y --> M
-        L --> Z[Analysis Cache - In-Memory]
+        Y[(MongoDB)] -.->|when reachable| L
+        Y2[(In-Memory Store)] -->|fallback| L
+        Y3[NCRB Corpus Generator] --> Y & Y2
+        Y3 --> M
+        L --> Z[Analysis Cache]
     end
 ```
 
@@ -66,7 +71,7 @@ graph TD
 | Entity Extractor | Hybrid: watsonx.ai + regex patterns | Extracts accused, victims, locations, MO, IPC sections |
 | Pattern Detector | RapidFuzz, custom algorithms | Cross-FIR matching, repeat offender detection, network identification |
 | Report Generator | watsonx.ai Granite 3 + templates | Generates station-level summaries and intelligence reports |
-| FIR Data Store | JSON files (mock), extensible to PostgreSQL | 25 realistic FIR records across 7 UP districts |
+| FIR Data Store | MongoDB when reachable, in-memory fallback | 100 generated NCRB-distribution FIRs across 13 UP districts |
 
 ## Data Flow
 

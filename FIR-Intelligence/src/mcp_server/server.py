@@ -1,270 +1,381 @@
-"""
-MCP Server for FIR Intelligence & Crime Pattern Detector.
+"""MCP server exposing FIR intelligence tools over stdio.
 
-This server exposes tools that IBM Bob CLI can call via the Model Context Protocol.
-It provides FIR analysis, entity extraction, repeat offender detection,
-and crime intelligence reporting capabilities.
+IBM Bob (or any MCP client) can call these tools to query the same analysis the
+web dashboard serves. It imports the modules at the repository root — the
+canonical implementation — rather than a private copy, so the assistant and the
+dashboard can never disagree about the corpus.
+
+Run directly for a JSON-RPC stdio server:
+
+    python src/mcp_server/server.py
 """
+
+from __future__ import annotations
+
+import asyncio
 import json
 import sys
-import asyncio
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+# The analysis modules live at the repository root.
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from models import AnalysisResult
-from nlp_engine import load_mock_firs, analyze_fir_batch, get_analysis_context
-from pattern_detector import detect_crime_networks
-from bob_client import classify_crime, chat_with_bob
+import intel_qa  # noqa: E402
+from models import AnalysisResult  # noqa: E402
+from nlp_engine import analyze_fir_batch, get_analysis_context  # noqa: E402
+from pattern_detector import detect_crime_networks  # noqa: E402
 
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_INFO = {"name": "fir-intelligence-server", "version": "2.1.0"}
+
+#: The corpus the dashboard serves, analysed once at startup.
 analysis_cache: AnalysisResult | None = None
+networks_cache: list[dict] = []
 
 
-async def initialize():
-    global analysis_cache
-    mock_data = load_mock_firs()
-    analysis_cache = await analyze_fir_batch(mock_data)
+async def initialize() -> AnalysisResult:
+    """Load and analyse the seeded corpus."""
+    global analysis_cache, networks_cache
+
+    from ncrb_seed import generate_ncrb_dataset
+
+    dataset = generate_ncrb_dataset(100)
+    for doc in dataset:
+        doc.pop("_source", None)
+        doc.pop("_network", None)
+
+    analysis_cache = await analyze_fir_batch(dataset)
+    networks_cache = detect_crime_networks(analysis_cache.fir_records)
+    return analysis_cache
+
+
+async def _ensure_ready() -> AnalysisResult:
+    if analysis_cache is None:
+        await initialize()
     return analysis_cache
 
 
 TOOLS = [
     {
         "name": "analyze_firs",
-        "description": "Analyze a batch of FIR text samples. Categorizes each by crime type, extracts named entities (accused, location, MO, victim profile), and returns structured results.",
+        "description": (
+            "Analyse a batch of raw FIR texts: classify the crime type, extract "
+            "accused, victims, location, IPC sections and modus operandi, and "
+            "report the entities found. Does not modify the loaded corpus."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "fir_texts": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Array of FIR text content to analyze"
+                    "type": "array", "items": {"type": "string"},
+                    "description": "FIR narrative texts to analyse",
                 }
             },
-            "required": ["fir_texts"]
-        }
+            "required": ["fir_texts"],
+        },
     },
     {
         "name": "get_repeat_offenders",
-        "description": "Detect repeat-offender signatures across all analyzed FIRs. Returns flagged offenders with linked FIR numbers, crime types, risk levels, and MO signatures.",
+        "description": (
+            "List accused linked to multiple FIRs, with linked FIR numbers, "
+            "districts, risk level, MO signature and match confidence."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "min_incidents": {
-                    "type": "integer",
-                    "description": "Minimum number of linked FIRs to flag as repeat offender",
-                    "default": 2
-                }
-            }
-        }
+                    "type": "integer", "default": 2,
+                    "description": "Minimum distinct FIRs to flag an offender",
+                },
+                "risk_level": {
+                    "type": "string",
+                    "enum": ["critical", "high", "medium", "low"],
+                    "description": "Optional risk level filter",
+                },
+            },
+        },
     },
     {
         "name": "get_station_summary",
-        "description": "Generate a station-level crime trend summary with crime breakdown, monthly trends, hotspot areas, and risk assessment.",
+        "description": (
+            "Station-level crime rollup: offence breakdown, monthly trend, "
+            "hotspot areas, repeat offender count and a risk assessment."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "station_name": {
                     "type": "string",
-                    "description": "Police station name (optional, returns all if omitted)"
+                    "description": "Station name filter; omit for all stations",
                 }
-            }
-        }
+            },
+        },
     },
     {
         "name": "get_crime_networks",
-        "description": "Identify organized crime networks by analyzing cross-FIR patterns, shared accused, and similar modus operandi across districts.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {}
-        }
+        "description": (
+            "Organised crime networks found by correlating shared offender "
+            "identities and shared modus operandi across FIRs."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "search_firs",
-        "description": "Search FIRs by crime type, district, accused name, or keyword.",
+        "description": "Search FIRs by crime type, district, station, accused name or keyword.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query — crime type, district name, accused name, or keyword"
-                }
+                "query": {"type": "string", "description": "Search text"},
+                "limit": {"type": "integer", "default": 25},
             },
-            "required": ["query"]
-        }
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "get_fir",
+        "description": "Full detail for one FIR by its FIR number.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"fir_number": {"type": "string"}},
+            "required": ["fir_number"],
+        },
+    },
+    {
+        "name": "ask_intelligence",
+        "description": (
+            "Ask a natural-language question about the corpus — patterns, "
+            "offenders, networks, districts, severity or a named individual — "
+            "and get an answer computed from the analysed FIRs."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"question": {"type": "string"}},
+            "required": ["question"],
+        },
     },
     {
         "name": "generate_intelligence_report",
-        "description": "Generate a comprehensive crime intelligence report covering patterns, repeat offenders, station analysis, and recommended actions.",
+        "description": (
+            "Full crime intelligence report: executive summary, pattern "
+            "analysis, repeat offender alerts, networks, station trends, "
+            "recommended actions and risk assessment."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "focus_area": {
                     "type": "string",
-                    "description": "Optional focus area: district name, crime type, or 'all'"
+                    "description": "Optional district or crime type to focus on",
                 }
-            }
-        }
+            },
+        },
     },
 ]
 
 
 async def handle_tool_call(name: str, arguments: dict) -> str:
-    global analysis_cache
-
-    if analysis_cache is None:
-        await initialize()
+    result = await _ensure_ready()
 
     if name == "analyze_firs":
-        fir_texts = arguments.get("fir_texts", [])
-        fir_data = [
+        texts = arguments.get("fir_texts") or []
+        if not texts:
+            return json.dumps({"error": "fir_texts must contain at least one FIR"})
+        batch = [
             {
-                "fir_number": f"UPLOADED/{i+1:03d}",
+                "fir_number": f"ADHOC/{i + 1:03d}",
                 "date_filed": "2024-01-01",
                 "police_station": "Unknown",
                 "district": "Unknown",
-                "state": "Uttar Pradesh",
                 "raw_text": text,
             }
-            for i, text in enumerate(fir_texts)
+            for i, text in enumerate(texts)
         ]
-        result = await analyze_fir_batch(fir_data)
-        analysis_cache = result
+        # Analyse into a local variable: overwriting the shared cache here made
+        # every later tool call report on the ad-hoc batch instead of the corpus.
+        adhoc = await analyze_fir_batch(batch)
+        crime_counts: dict[str, int] = {}
+        for fir in adhoc.fir_records:
+            key = fir.crime_type.value if fir.crime_type else "other"
+            crime_counts[key] = crime_counts.get(key, 0) + 1
         return json.dumps({
-            "total_processed": result.total_firs_processed,
-            "crime_types": {
-                fir.crime_type.value if fir.crime_type else "other": 1
-                for fir in result.fir_records
-            },
-            "entities_extracted": result.entity_stats,
-            "repeat_offenders": len(result.repeat_offenders),
+            "total_processed": adhoc.total_firs_processed,
+            "crime_types": crime_counts,
+            "entities_extracted": adhoc.entity_stats,
+            "repeat_offenders_within_batch": len(adhoc.repeat_offenders),
+            "records": [
+                {
+                    "fir_number": f.fir_number,
+                    "crime_type": f.crime_type.value if f.crime_type else "other",
+                    "severity_score": f.severity_score,
+                    "ipc_sections": f.ipc_sections,
+                    "accused": [a.model_dump() for a in f.accused],
+                    "victims": [v.model_dump() for v in f.victims],
+                    "modus_operandi": (f.modus_operandi.model_dump()
+                                       if f.modus_operandi else None),
+                    "summary": f.summary,
+                }
+                for f in adhoc.fir_records
+            ],
         }, indent=2)
 
-    elif name == "get_repeat_offenders":
-        min_inc = arguments.get("min_incidents", 2)
-        offenders = [
-            ro for ro in analysis_cache.repeat_offenders
-            if ro.total_incidents >= min_inc
-        ]
-        return json.dumps([
-            {
-                "name": ro.name,
-                "aliases": ro.aliases,
-                "linked_firs": ro.linked_firs,
-                "crime_types": ro.crime_types,
-                "districts": ro.districts,
-                "risk_level": ro.risk_level.value,
-                "total_incidents": ro.total_incidents,
-                "mo_signature": ro.mo_signature,
-                "confidence": ro.confidence_score,
-            }
-            for ro in offenders
-        ], indent=2)
+    if name == "get_repeat_offenders":
+        minimum = int(arguments.get("min_incidents", 2))
+        risk = arguments.get("risk_level")
+        offenders = [o for o in result.repeat_offenders if o.total_incidents >= minimum]
+        if risk:
+            offenders = [o for o in offenders if o.risk_level.value == risk]
+        return json.dumps([o.model_dump(mode="json") for o in offenders], indent=2)
 
-    elif name == "get_station_summary":
+    if name == "get_station_summary":
         station = arguments.get("station_name")
-        summaries = analysis_cache.station_summaries
+        summaries = result.station_summaries
         if station:
-            summaries = [s for s in summaries if station.lower() in s.station_name.lower()]
-        return json.dumps([s.model_dump() for s in summaries], indent=2)
+            summaries = [s for s in summaries
+                         if station.lower() in s.station_name.lower()]
+        return json.dumps([s.model_dump(mode="json") for s in summaries], indent=2)
 
-    elif name == "get_crime_networks":
-        networks = detect_crime_networks(analysis_cache.fir_records)
-        return json.dumps(networks, indent=2)
+    if name == "get_crime_networks":
+        return json.dumps(networks_cache, indent=2, default=str)
 
-    elif name == "search_firs":
-        query = arguments.get("query", "").lower()
-        matches = []
-        for fir in analysis_cache.fir_records:
-            if (query in fir.raw_text.lower() or
-                query in (fir.crime_type.value if fir.crime_type else "") or
-                query in fir.district.lower() or
-                query in fir.police_station.lower() or
-                any(query in a.name.lower() for a in fir.accused)):
-                matches.append({
-                    "fir_number": fir.fir_number,
-                    "crime_type": fir.crime_type.value if fir.crime_type else "other",
-                    "district": fir.district,
-                    "station": fir.police_station,
-                    "summary": fir.summary,
-                    "accused": [a.name for a in fir.accused],
-                })
-        return json.dumps(matches, indent=2)
+    if name == "search_firs":
+        query = (arguments.get("query") or "").lower().strip()
+        limit = int(arguments.get("limit", 25))
+        if not query:
+            return json.dumps({"error": "query must not be empty"})
+        matches = [
+            {
+                "fir_number": fir.fir_number,
+                "date_filed": fir.date_filed.isoformat(),
+                "crime_type": fir.crime_type.value if fir.crime_type else "other",
+                "district": fir.district,
+                "station": fir.police_station,
+                "severity_score": fir.severity_score,
+                "summary": fir.summary,
+                "accused": [a.name for a in fir.accused],
+            }
+            for fir in result.fir_records
+            if query in fir.raw_text.lower()
+            or query == (fir.crime_type.value if fir.crime_type else "")
+            or query in fir.district.lower()
+            or query in fir.police_station.lower()
+            or query in fir.fir_number.lower()
+            or any(query in a.name.lower() for a in fir.accused)
+        ]
+        return json.dumps({"total": len(matches), "results": matches[:limit]}, indent=2)
 
-    elif name == "generate_intelligence_report":
-        context = await get_analysis_context(analysis_cache)
-        return context
+    if name == "get_fir":
+        number = arguments.get("fir_number", "")
+        for fir in result.fir_records:
+            if fir.fir_number == number:
+                return json.dumps(fir.model_dump(mode="json"), indent=2)
+        return json.dumps({"error": f"FIR {number} not found"})
+
+    if name == "ask_intelligence":
+        question = arguments.get("question", "")
+        return intel_qa.answer_question(question, result, networks_cache)
+
+    if name == "generate_intelligence_report":
+        focus = (arguments.get("focus_area") or "").strip()
+        report = intel_qa.build_report(result, networks_cache)
+        if focus and focus.lower() != "all":
+            focused = intel_qa.answer_question(focus, result, networks_cache)
+            report += f"\n\n8. FOCUS: {focus.upper()}\n{focused}"
+        return report
 
     return json.dumps({"error": f"Unknown tool: {name}"})
 
 
-async def run_stdio_server():
-    """Run as MCP server using stdio transport."""
-    await initialize()
+def _response(req_id, result: dict) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
-    while True:
+
+def _error(req_id, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+async def dispatch(request: dict) -> dict | None:
+    """Handle one JSON-RPC request. Returns ``None`` for notifications."""
+    method = request.get("method", "")
+    req_id = request.get("id")
+
+    # Notifications carry no id and MUST NOT be answered. The previous version
+    # replied with `{"id": null, "result": {}}`, which is a protocol violation.
+    if req_id is None:
+        return None
+
+    if method == "initialize":
+        return _response(req_id, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": SERVER_INFO,
+        })
+
+    if method == "tools/list":
+        return _response(req_id, {"tools": TOOLS})
+
+    if method == "tools/call":
+        params = request.get("params") or {}
+        tool_name = params.get("name", "")
+        if not any(tool["name"] == tool_name for tool in TOOLS):
+            return _error(req_id, -32602, f"Unknown tool: {tool_name}")
         try:
-            line = await asyncio.get_event_loop().run_in_executor(
-                None, sys.stdin.readline
-            )
-            if not line:
-                break
+            text = await handle_tool_call(tool_name, params.get("arguments") or {})
+        except Exception as exc:  # noqa: BLE001 - report, never kill the server
+            return _response(req_id, {
+                "content": [{"type": "text", "text": f"Tool failed: {exc}"}],
+                "isError": True,
+            })
+        return _response(req_id, {"content": [{"type": "text", "text": text}]})
 
-            request = json.loads(line.strip())
-            method = request.get("method", "")
-            req_id = request.get("id")
+    if method == "ping":
+        return _response(req_id, {})
 
-            if method == "initialize":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {"tools": {"listChanged": False}},
-                        "serverInfo": {
-                            "name": "fir-intelligence-server",
-                            "version": "1.0.0",
-                        },
-                    },
-                }
-            elif method == "tools/list":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {"tools": TOOLS},
-                }
-            elif method == "tools/call":
-                params = request.get("params", {})
-                tool_name = params.get("name", "")
-                tool_args = params.get("arguments", {})
-                result_text = await handle_tool_call(tool_name, tool_args)
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {
-                        "content": [{"type": "text", "text": result_text}],
-                    },
-                }
-            else:
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {},
-                }
+    return _error(req_id, -32601, f"Method not found: {method}")
 
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
 
-        except (json.JSONDecodeError, EOFError):
+async def run_stdio_server() -> None:
+    """Serve MCP over stdio."""
+    await initialize()
+    print(f"FIR Intelligence MCP server ready — "
+          f"{analysis_cache.total_firs_processed} FIRs, "
+          f"{len(analysis_cache.repeat_offenders)} repeat offenders, "
+          f"{len(networks_cache)} networks", file=sys.stderr, flush=True)
+
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:  # EOF — the client closed the pipe
             break
-        except Exception as e:
-            error_resp = {
-                "jsonrpc": "2.0",
-                "id": req_id if 'req_id' in dir() else None,
-                "error": {"code": -32603, "message": str(e)},
-            }
-            sys.stdout.write(json.dumps(error_resp) + "\n")
-            sys.stdout.flush()
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            # A single malformed line used to terminate the whole server.
+            # Report a parse error and keep serving.
+            _write(_error(None, -32700, f"Parse error: {exc}"))
+            continue
+
+        try:
+            response = await dispatch(request)
+        except Exception as exc:  # noqa: BLE001
+            response = _error(request.get("id"), -32603, str(exc))
+
+        if response is not None:
+            _write(response)
+
+
+def _write(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_stdio_server())
+    try:
+        asyncio.run(run_stdio_server())
+    except KeyboardInterrupt:
+        pass

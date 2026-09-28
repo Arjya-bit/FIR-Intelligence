@@ -138,12 +138,21 @@ function NetworkGraph({ network, color }) {
 }
 
 function getNetworkBrief(net) {
-  const briefs = {
-    'Jamtara Cyber Fraud Network': `Inter-state cyber fraud operation using "Vikram Sharma" alias for KYC/investment scams. Targets elderly and middle-class victims across ${net.districts.join(', ')}. Money trail leads to Jamtara/Deoghar, Jharkhand. Estimated total fraud: Rs. 2+ crore. Requires coordinated action with Jharkhand Cyber Cell.`,
-    'Bablu Chain Snatching Gang': `Organized snatching gang operating in the Charbagh-Hazratganj corridor of Lucknow. Uses black Pulsar motorcycle (no plates), operates 2100-0000 hours, targets lone pedestrians near railway station. Escalating from snatching to armed robbery and vehicle theft.`,
-    'Kanpur Commercial Burglary Ring': `Professional burglary gang targeting commercial establishments across Kanpur. Signature MO: gas cutter on shutters/locks, CCTV DVR removal, white Eeco van, early morning hours (0100-0400). Forensic evidence (tool marks, fingerprints) confirms same gang across all incidents. Estimated loot: Rs. 2+ crore.`,
-    'Munna Bhai Extortion Gang': `Cross-district extortion racket operating in Varanasi and Prayagraj. Uses "Munna Bhai" as terror brand. Three-stage escalation: threatening calls, physical assault, arson/robbery on refusal. Expanding territory from tourist areas to new businesses.`,
-    'Nepal Border Drug Supply Network': `Drug supply chain from Nepal border through Gorakhpur-Lucknow-Meerut. Multiple nodes arrested but supply chain continues. High-value seizures (15+ kg heroin) indicate major trafficking operation. Cross-border coordination needed.`,
-  };
-  return briefs[net.name] || `Organized network spanning ${net.districts.join(', ')} with ${net.fir_count} linked incidents.`;
+  // The backend computes this from the actual cluster (member names, districts,
+  // date range, shared MO). It used to be a lookup table keyed by network name,
+  // which asserted fixed figures — "Rs. 2+ crore", "15+ kg heroin" — whatever
+  // the analysed corpus really contained.
+  if (net.intelligence_brief) return net.intelligence_brief;
+
+  const members = (net.key_members || []).slice(0, 4);
+  const period = net.active_period
+    ? ` Active ${net.active_period.start} to ${net.active_period.end}.`
+    : '';
+  return (
+    `${net.fir_count} FIRs linked across ${(net.districts || []).join(', ')}.` +
+    `${members.length ? ` Key members: ${members.join(', ')}.` : ''}` +
+    `${net.mo_signature ? ` Shared MO: ${net.mo_signature}.` : ''}` +
+    period
+  );
 }
+

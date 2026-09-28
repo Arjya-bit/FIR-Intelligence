@@ -46,8 +46,9 @@ submission:
     - "MCP Protocol — server for Bob CLI tool integration"
   bob_usage: >
     IBM Bob is the primary intelligence interface. The MCP server exposes
-    6 tools (analyze_firs, get_repeat_offenders, get_station_summary,
-    get_crime_networks, search_firs, generate_intelligence_report) that
+    8 tools (analyze_firs, get_repeat_offenders, get_station_summary,
+    get_crime_networks, search_firs, get_fir, ask_intelligence,
+    generate_intelligence_report) that
     Bob calls via the Model Context Protocol. Bob's Granite backbone powers
     crime classification, entity extraction, and natural language report
     generation. The web dashboard's chat interface also routes through

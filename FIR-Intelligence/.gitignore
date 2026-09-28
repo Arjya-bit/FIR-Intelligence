@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets — never commit real watsonx.ai credentials (.env.example is tracked)
+.env
+.env.*
+!.env.example
+
+# Node / frontend build
+node_modules/
+dist/
+build/
+.vite/
+npm-debug.log*
+
+# static/vendor/ IS tracked on purpose: it lets the dashboard run with no CDN
+# access. Regenerate it with ./scripts/build-ui.sh.
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
