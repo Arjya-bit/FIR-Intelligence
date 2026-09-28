@@ -128,6 +128,37 @@ ALIASES = [
     "Sonu", "Monu", "Golu", "Bunty", "Lucky", "Raja",
 ]
 
+# ── Combinatorial name pool for unaffiliated (non-network) persons ──
+# The curated lists above are small on purpose: they name the members of the
+# seeded criminal networks. Drawing *every* accused from them would make
+# unrelated FIRs collide on name constantly, and the pattern detector would
+# then report those coincidences as cross-district "networks". A first x
+# surname product gives ~2,800 distinct names so a collision is rare enough to
+# be genuine signal.
+FIRST_NAMES_M = [
+    "Aakash", "Abhishek", "Ajeet", "Alok", "Aman", "Ambrish", "Anurag",
+    "Ashok", "Avinash", "Badri", "Bhupendra", "Brijesh", "Chandan",
+    "Dhirendra", "Dilip", "Gaurav", "Girish", "Hemant", "Hriday", "Indrajeet",
+    "Jitendra", "Kailash", "Karan", "Keshav", "Kuldeep", "Lalit", "Mahendra",
+    "Mukesh", "Naveen", "Nitin", "Parvez", "Prashant", "Rajeev", "Ranjeet",
+    "Rupesh", "Sachin", "Shailendra", "Shashank", "Shyam", "Sudhir", "Tarun",
+    "Udai", "Vikas", "Vishal", "Yashpal", "Zafar", "Imran", "Rizwan",
+    "Salman", "Tabrez",
+]
+FIRST_NAMES_F = [
+    "Aarti", "Alka", "Anjali", "Archana", "Babita", "Chanda", "Deepti",
+    "Ekta", "Gayatri", "Hemlata", "Indu", "Jyoti", "Kiran", "Madhu",
+    "Nandini", "Preeti", "Radha", "Sarita", "Shalini", "Urmila", "Vandana",
+    "Yashoda", "Nazma", "Rukhsana", "Shabnam",
+]
+SURNAMES = [
+    "Agnihotri", "Awasthi", "Bajpai", "Bhargava", "Chaturvedi", "Dwivedi",
+    "Gaur", "Goswami", "Kushwaha", "Lodhi", "Maurya", "Nigam", "Pathak",
+    "Prajapati", "Rastogi", "Saxena", "Shukla", "Sengar", "Trivedi",
+    "Upadhyay", "Vaish", "Bhadauria", "Chauhan", "Katiyar", "Nishad",
+    "Rawat", "Sahu", "Solanki", "Ansari", "Qureshi", "Siddiqui", "Usmani",
+]
+
 ADDRESSES_BY_DISTRICT = {
     "Lucknow": ["Gomti Nagar", "Indira Nagar", "Aliganj", "Rajajipuram", "Alambagh",
                  "Thakurganj", "Aminabad", "Charbagh", "Kaiserbagh", "Husainabad"],
@@ -145,6 +176,16 @@ ADDRESSES_BY_DISTRICT = {
                   "Sahibabad", "Loni", "Crossing Republik"],
     "Meerut": ["Shastri Nagar", "Lisari Gate", "Sadar Bazaar", "Cantt",
                "Partapur", "Abu Lane"],
+    "Bareilly": ["Izzatnagar", "Baradari", "Prem Nagar", "Subhash Nagar",
+                 "Rajendra Nagar", "Cantt"],
+    "Aligarh": ["Sasni Gate", "Gandhi Park", "Bannadevi", "Quarsi",
+                "Ramghat Road", "Dodhpur"],
+    "Moradabad": ["Katghar", "Pakbara", "Civil Lines", "Mughalpura",
+                  "Buddhi Vihar"],
+    "Jhansi": ["Sipri Bazaar", "Civil Lines", "Nawabad", "Gwalior Road",
+               "Talpura"],
+    "Mathura": ["Govardhan", "Vrindavan", "Krishna Nagar", "Highway Colony",
+                "Chhata"],
 }
 
 # ── IPC Sections by Crime Type (from NCRB classification) ──
@@ -289,6 +330,12 @@ def _gen_phone():
     return f"+91-{random.choice(['9','8','7','6'])}{random.randint(100000000, 999999999)}"
 
 
+def _random_person(gender: str = "Male") -> str:
+    """A distinct full name for someone unconnected to the seeded networks."""
+    first = random.choice(FIRST_NAMES_F if gender == "Female" else FIRST_NAMES_M)
+    return f"{first} {random.choice(SURNAMES)}"
+
+
 def generate_fir(idx: int, crime_type: str, network_key: str = None) -> dict:
     district, station = _pick_district()
     fir_date = _pick_date()
@@ -316,20 +363,21 @@ def generate_fir(idx: int, crime_type: str, network_key: str = None) -> dict:
                 "aliases": [alias] if alias else [],
                 "age": random.randint(20, 45),
                 "gender": "Male",
-                "father_name": random.choice(MALE_NAMES).split()[0] + " " + random.choice(["Prasad", "Singh", "Yadav", "Khan"]),
+                "father_name": _random_person("Male"),
                 "address": random.choice(ADDRESSES_BY_DISTRICT.get(district, ["Unknown area"])),
                 "id_marks": random.choice([[], ["scar on left cheek"], ["tattoo on right arm"], []]),
                 "phone": None,
             })
     else:
         for _ in range(num_accused):
-            name = random.choice(MALE_NAMES)
             accused.append({
-                "name": name,
-                "aliases": [random.choice(ALIASES)] if random.random() > 0.5 else [],
+                "name": _random_person("Male"),
+                # Nicknames are common but far from unique, so only a minority
+                # of records carry one — matching on them alone is unsafe.
+                "aliases": [random.choice(ALIASES)] if random.random() > 0.8 else [],
                 "age": random.randint(18, 55),
                 "gender": "Male",
-                "father_name": None,
+                "father_name": _random_person("Male"),
                 "address": random.choice(ADDRESSES_BY_DISTRICT.get(district, ["Unknown area"])),
                 "id_marks": [],
                 "phone": None,
@@ -341,7 +389,7 @@ def generate_fir(idx: int, crime_type: str, network_key: str = None) -> dict:
     for _ in range(num_victims):
         is_female = random.random() > 0.6
         victims.append({
-            "name": random.choice(FEMALE_NAMES if is_female else MALE_NAMES),
+            "name": _random_person("Female" if is_female else "Male"),
             "age": random.randint(20, 70),
             "gender": "Female" if is_female else "Male",
             "occupation": random.choice(["Businessman", "Shopkeeper", "Teacher", "Farmer", "Housewife", "Student", "Doctor", "Engineer", "Retired", "Labourer"]),
@@ -425,7 +473,7 @@ def generate_fir(idx: int, crime_type: str, network_key: str = None) -> dict:
 
     raw_text = (
         f"FIR No. {idx:03d}/2024 dated {fir_date}. "
-        f"PS {station}, District {district}. "
+        f"PS {station.removesuffix(' PS')}, District {district}. "
         f"Complainant: {'Shri' if complainant['gender']=='Male' else 'Smt.'} {complainant['name']}, "
         f"age {complainant['age']} years, "
         f"R/o {complainant['address']}, {district}. "

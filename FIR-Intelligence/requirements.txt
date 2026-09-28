@@ -1,10 +1,19 @@
+# Core API
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
-python-dotenv==1.0.1
-httpx==0.28.1
-rapidfuzz==3.11.0
 python-multipart==0.0.20
 orjson==3.10.13
+
+# Config + outbound HTTP (IBM watsonx.ai)
+python-dotenv==1.0.1
+httpx==0.28.1
+
+# NLP / pattern detection
+rapidfuzz==3.11.0
+
+# Storage — optional at runtime, the app falls back to an in-memory store.
+# motor 3.6.x pins pymongo<4.10, which conflicts with the pin below; 3.7.x
+# allows pymongo>=4.9,<5.
 pymongo==4.10.1
-motor==3.6.0
+motor==3.7.0

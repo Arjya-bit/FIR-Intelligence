@@ -1,164 +1,162 @@
 # Setup Guide
 
-Complete instructions to run the FIR Intelligence & Crime Pattern Detector on your machine.
-
 ## Prerequisites
 
-| Tool | Version | Check Command |
-|------|---------|--------------|
-| Python | 3.11+ | `python --version` |
-| Node.js | 18+ | `node --version` |
-| npm | 9+ | `npm --version` |
-| pip | 23+ | `pip --version` |
-| Git | 2.30+ | `git --version` |
+- **Python 3.11+** (required — the code uses `X | Y` type syntax and `str.removesuffix`)
+- Node.js 18+ — only if you want to rebuild the dashboard or run the optional Vite client
+- An IBM Cloud account with watsonx.ai access — optional
 
-### Optional (for IBM watsonx.ai integration)
-- IBM Cloud account with watsonx.ai access
-- API key from https://cloud.ibm.com/iam/apikeys
-- watsonx.ai project ID
+Nothing else. No database server, no API key, no build step.
 
-> **Note**: The system works fully without watsonx.ai credentials using a rule-based fallback. The AI features are enhanced when credentials are provided.
-
-## Step 1: Clone the Repository
+## Step 1: Clone
 
 ```bash
-git clone https://github.com/<your-username>/bob-ai-hackathon-crimeintel-ai.git
-cd bob-ai-hackathon-crimeintel-ai
+git clone https://github.com/Arjya-bit/FIR-Intelligence.git
+cd FIR-Intelligence
 ```
 
-## Step 2: Set Up the Backend
+## Step 2: Install and run
 
 ```bash
-cd src/backend
-```
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
-### Create a virtual environment (recommended)
-
-```bash
-python -m venv venv
-
-# On Windows:
-venv\Scripts\activate
-
-# On macOS/Linux:
-source venv/bin/activate
-```
-
-### Install dependencies
-
-```bash
 pip install -r requirements.txt
-```
-
-### Configure environment variables
-
-```bash
-cp ../.env.example .env
-```
-
-Edit `.env` with your credentials (optional):
-
-```env
-WATSONX_API_KEY=your_api_key_here
-WATSONX_PROJECT_ID=your_project_id_here
-WATSONX_URL=https://us-south.ml.cloud.ibm.com
-```
-
-If you don't have watsonx.ai credentials, leave the defaults — the system will use the rule-based fallback.
-
-### Start the backend server
-
-```bash
 python main.py
 ```
 
-You should see:
+Expected output:
+
 ```
-Loading and analyzing mock FIR data...
-Analyzed 25 FIRs, found X repeat offenders
-INFO:     Uvicorn running on http://0.0.0.0:8000
+==============================================================
+  FIR Intelligence & Crime Pattern Detector
+  NLP + cross-FIR correlation for CCTNS-style records
+==============================================================
+Storage: in-memory fallback — MongoDB at mongodb://localhost:27017 unavailable
+Seeding corpus with 100 NCRB-based FIR records...
+Seeded 100 FIR records
+
+Running NLP analysis...
+Analysed 100 FIRs — 28 repeat offenders, 14 networks
+Language model: rule-based (no credentials)
+Storage: in-memory
+
+Dashboard: http://localhost:8000
+API docs:  http://localhost:8000/docs
 ```
 
-### Verify backend is running
+The exact offender and network counts vary with the generated corpus.
+
+Open <http://localhost:8000>.
+
+## Step 3 (optional): Configure
 
 ```bash
-curl http://localhost:8000/api/health
+cp .env.example .env
 ```
 
-Expected response:
-```json
-{"status":"ok","firs_loaded":25}
+Every setting is optional.
+
+### watsonx.ai
+
+```env
+WATSONX_API_KEY=your-key
+WATSONX_PROJECT_ID=your-project-id
+WATSONX_URL=https://us-south.ml.cloud.ibm.com
 ```
 
-## Step 3: Set Up the Frontend
+Get these from IBM Cloud → watsonx.ai → your project → **Manage → General** (project ID) and
+**IAM → API keys** (key).
 
-Open a **new terminal** (keep the backend running):
+Without them the service classifies with a keyword engine and answers questions and reports
+deterministically from the analysed corpus. `/api/health` reports which is active.
+
+### MongoDB
+
+```env
+FIR_STORAGE=auto                   # auto | memory | mongodb
+MONGO_URL=mongodb://localhost:27017
+MONGO_DB=fir_intelligence
+```
+
+`auto` uses MongoDB when it answers a ping within `MONGO_TIMEOUT_MS`, otherwise it falls
+back to the in-memory store and says so at startup. Use `mongodb` to make an unreachable
+server a hard failure instead, or `memory` to skip the probe.
+
+With Docker:
+
+```bash
+docker run -d -p 27017:27017 --name fir-mongo mongo:7
+```
+
+### Exposing the service
+
+The server binds to `127.0.0.1` by default. To reach it from another machine:
+
+```env
+FIR_HOST=0.0.0.0
+```
+
+There is no authentication — put an authenticating reverse proxy in front of it before
+exposing it anywhere real.
+
+## Step 4 (optional): The Vite client
+
+`static/` already contains a working dashboard. The React client in `src/frontend` is an
+alternative with hot reload:
 
 ```bash
 cd src/frontend
 npm install
-npm run dev
+npm run dev          # http://localhost:5173, proxies /api to port 8000
 ```
 
-You should see:
-```
-VITE v6.x.x  ready in xxx ms
-➜  Local:   http://localhost:5173/
-```
-
-## Step 4: Open the Dashboard
-
-Open **http://localhost:5173** in your browser.
-
-You should see the FIR Intelligence dashboard with:
-- Crime type distribution chart
-- District-wise FIR counts
-- Monthly crime trends
-- Severity distribution
-- Identified crime networks
-
-## Step 5: IBM Bob CLI Integration (Optional)
-
-To use the MCP server with IBM Bob CLI:
-
-### Register the MCP server
+## Step 5 (optional): IBM Bob CLI
 
 ```bash
 bob mcp add fir-intelligence -- python src/mcp_server/server.py
-```
-
-### Use in Bob chat
-
-```bash
 bob chat
 ```
 
-Then try commands like:
-- "Show me repeat offenders across Lucknow"
-- "What crime networks are active?"
-- "Generate an intelligence report for Kanpur burglaries"
+Then ask Bob things like "who are the repeat offenders?" or "show me the crime networks".
 
-## Verification Checklist
+## Running the tests
 
-| Step | Expected Result |
-|------|----------------|
-| Backend starts | "Analyzed 25 FIRs, found X repeat offenders" |
-| `GET /api/health` | `{"status":"ok","firs_loaded":25}` |
-| `GET /api/dashboard` | JSON with crime_breakdown, district_breakdown |
-| Frontend loads | Dashboard with charts and statistics |
-| Click "FIR Records" | 25 FIR cards with entity details |
-| Click "Repeat Offenders" | Flagged offenders with risk levels |
-| Click "Crime Networks" | 5 identified networks with graphs |
-| Click "Bob AI Chat" | Chat interface responds to queries |
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+## Rebuilding the dashboard
+
+`static/app.js` is compiled from `static/app.jsx`, and `static/vendor/` holds the React and
+Recharts bundles. After editing the source:
+
+```bash
+./scripts/build-ui.sh
+```
+
+Shipping it precompiled means the browser never downloads or runs Babel, and the dashboard
+works with no CDN access.
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| `ModuleNotFoundError` | Run `pip install -r requirements.txt` in the backend directory |
-| Backend port 8000 in use | Kill existing process: `lsof -i :8000` then `kill <PID>` |
-| Frontend can't reach API | Ensure backend is running on port 8000; check Vite proxy in `vite.config.js` |
-| `npm install` fails | Delete `node_modules` and `package-lock.json`, then `npm install` again |
-| watsonx.ai auth error | Check API key in `.env`; system falls back to rules if auth fails |
-| Charts not loading | Refresh the page; check browser console for errors |
-| CORS errors | Backend CORS is set to `*`; ensure both servers are running |
+| Symptom | Cause and fix |
+|---------|---------------|
+| `ResolutionImpossible` on install | Old pins. `requirements.txt` needs `motor==3.7.0`; motor 3.6.x caps `pymongo<4.10`. |
+| `Address already in use` | Another process holds port 8000. Set `FIR_PORT`, or stop it. |
+| "Dashboard assets could not load" | `static/vendor/` is missing or empty. Run `./scripts/build-ui.sh`. |
+| Startup says "in-memory fallback" | No MongoDB reachable. Expected, and fine — data just does not persist across restarts. |
+| `/api/*` returns 503 | Startup analysis has not finished. Wait a few seconds. |
+| Blank charts, `/api/dashboard` 200 | Stale `static/app.js`. Run `./scripts/build-ui.sh`. |
+| watsonx.ai 401 after ~1 hour | Fixed: IAM tokens now refresh before expiry. Ensure you are on the current `bob_client.py`. |
+
+## Verifying the install
+
+```bash
+curl -s localhost:8000/api/health
+curl -s "localhost:8000/api/firs?limit=1"
+curl -s -X POST localhost:8000/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Who are the repeat offenders?"}'
+```

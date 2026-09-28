@@ -1,4 +1,10 @@
+"""FIR ingestion pipeline: classify, extract entities, correlate."""
+
+from __future__ import annotations
+
+import asyncio
 import json
+import os
 from datetime import date, datetime
 from pathlib import Path
 
@@ -11,13 +17,16 @@ from entity_extractor import (
     extract_modus_operandi, extract_ipc_sections, compute_severity,
     extract_vehicles, extract_phone_numbers, extract_stolen_values,
 )
-from pattern_detector import (
-    detect_repeat_offenders, generate_station_summaries, detect_crime_networks
-)
+from pattern_detector import detect_repeat_offenders, generate_station_summaries
 from bob_client import classify_crime
 
 
 DATA_DIR = Path(__file__).parent / "data"
+
+#: Bound on concurrent classification calls. Sequential awaits made a
+#: 100-FIR startup take 100 round trips to watsonx.ai; unbounded gather
+#: trips the API rate limit.
+CLASSIFY_CONCURRENCY = int(os.getenv("FIR_CLASSIFY_CONCURRENCY", "8"))
 
 
 def load_mock_firs() -> list[dict]:
@@ -111,10 +120,14 @@ async def process_single_fir(fir_data: dict) -> FIRRecord:
 
 
 async def analyze_fir_batch(fir_data_list: list[dict]) -> AnalysisResult:
-    fir_records = []
-    for fir_data in fir_data_list:
-        record = await process_single_fir(fir_data)
-        fir_records.append(record)
+    """Run the full pipeline over a batch of raw FIR dicts."""
+    semaphore = asyncio.Semaphore(CLASSIFY_CONCURRENCY)
+
+    async def process(fir_data: dict) -> FIRRecord:
+        async with semaphore:
+            return await process_single_fir(fir_data)
+
+    fir_records = list(await asyncio.gather(*(process(d) for d in fir_data_list)))
 
     repeat_offenders = detect_repeat_offenders(fir_records)
     station_summaries = generate_station_summaries(fir_records, repeat_offenders)
@@ -149,42 +162,61 @@ async def analyze_fir_batch(fir_data_list: list[dict]) -> AnalysisResult:
     )
 
 
-async def get_analysis_context(result: AnalysisResult) -> str:
-    lines = [
-        f"Total FIRs: {result.total_firs_processed}",
-        f"Repeat Offenders: {len(result.repeat_offenders)}",
-        "",
-        "Crime Breakdown:",
-    ]
+async def get_analysis_context(result: AnalysisResult,
+                               networks: list[dict] | None = None,
+                               max_items: int = 15) -> str:
+    """A compact factual digest of the corpus, used to ground LLM prompts.
 
+    ``networks`` is passed in by the caller because recomputing it here made
+    every chat turn re-run the whole correlation pass.
+    """
+    districts: dict[str, int] = {}
     crime_counts: dict[str, int] = {}
     for fir in result.fir_records:
         ct = fir.crime_type.value if fir.crime_type else "other"
         crime_counts[ct] = crime_counts.get(ct, 0) + 1
-    for ct, count in sorted(crime_counts.items(), key=lambda x: -x[1]):
-        lines.append(f"  {ct}: {count}")
+        districts[fir.district] = districts.get(fir.district, 0) + 1
 
-    lines.append("\nRepeat Offenders:")
-    for ro in result.repeat_offenders:
-        lines.append(
-            f"  {ro.name} (aliases: {', '.join(ro.aliases)}) - "
-            f"{ro.total_incidents} FIRs across {', '.join(ro.districts)} - "
-            f"Risk: {ro.risk_level.value} - Crimes: {', '.join(ro.crime_types)}"
-        )
+    lines = [
+        f"Total FIRs analysed: {result.total_firs_processed}",
+        f"Districts: {len(districts)} | Stations: {len(result.station_summaries)}",
+        f"Repeat offenders flagged: {len(result.repeat_offenders)}",
+        "",
+        "Crime breakdown:",
+    ]
+    lines += [f"  {ct}: {count}"
+              for ct, count in sorted(crime_counts.items(), key=lambda x: -x[1])]
 
-    networks = detect_crime_networks(result.fir_records)
-    if networks:
-        lines.append("\nIdentified Crime Networks:")
-        for net in networks:
+    lines += ["", "District caseload:"]
+    lines += [f"  {d}: {count}" for d, count in
+              sorted(districts.items(), key=lambda x: -x[1])[:max_items]]
+
+    if result.repeat_offenders:
+        lines += ["", "Repeat offenders (most active first):"]
+        for offender in result.repeat_offenders[:max_items]:
+            aliases = f" (aliases: {', '.join(offender.aliases)})" if offender.aliases else ""
             lines.append(
-                f"  {net['name']}: {net['fir_count']} FIRs across {', '.join(net['districts'])}"
+                f"  {offender.name}{aliases} — {offender.total_incidents} FIRs "
+                f"[{', '.join(offender.linked_firs[:6])}] across "
+                f"{', '.join(offender.districts)}; risk {offender.risk_level.value}; "
+                f"offences {', '.join(offender.crime_types)}"
             )
 
-    lines.append("\nStation Summaries:")
-    for ss in result.station_summaries:
+    if networks:
+        lines += ["", "Identified crime networks:"]
+        for net in networks[:max_items]:
+            lines.append(
+                f"  {net['name']}: {net['fir_count']} FIRs across "
+                f"{', '.join(net['districts'])} "
+                f"[{', '.join(net['fir_numbers'][:6])}]"
+            )
+
+    lines += ["", "Station summaries (busiest first):"]
+    for station in result.station_summaries[:max_items]:
         lines.append(
-            f"  {ss.station_name} ({ss.district}): {ss.total_firs} FIRs, "
-            f"Top crime: {ss.top_crime}, Risk: {ss.risk_assessment[:20]}"
+            f"  {station.station_name} ({station.district}): "
+            f"{station.total_firs} FIRs, top crime {station.top_crime}, "
+            f"{station.repeat_offenders_count} repeat offenders"
         )
 
     return "\n".join(lines)

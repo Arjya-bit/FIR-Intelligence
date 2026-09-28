@@ -59,135 +59,210 @@ VEHICLE_PATTERN = re.compile(
 VALUE_PATTERN = re.compile(r'Rs\.?\s*([\d,]+(?:\.\d{2})?)\s*(?:lakh|crore)?', re.IGNORECASE)
 
 
+#: A proper name: capitalised tokens. Patterns built on this must NOT be
+#: compiled with ``re.IGNORECASE`` — that makes ``[A-Z][a-z]+`` match lowercase
+#: words, so "Accused identified as Bablu" yields the name "identified as
+#: Bablu". Keyword prefixes get scoped ``(?i:...)`` groups instead.
+_NAME = r"[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}"
+
+#: Constructs that actually *name* someone. Matching on bare trigger words
+#: instead pulls in narrative nouns — "The accused persons fled towards
+#: Charbagh railway station" would yield an accused called "Charbagh".
+_ACCUSED_TRIGGER = re.compile(
+    r"(?i:"
+    r"identified\s+(?:(?:(?!\bas\b)[^,.]){0,45}\s)?as\b"
+    r"|known\s+(?:(?:(?!\bas\b)[^,.]){0,30}\s)?as\b"
+    r"|claiming\s+to\s+be"
+    r"|identified\s*:"
+    r"|(?:accused|arrested|apprehended|detained|suspects?|wanted)\s*:"
+    r"|arrested\s+(?=[A-Z(])"
+    r"|apprehended\s+(?=[A-Z(])"
+    r"|named\s+(?=[A-Z])"
+    r"|suspects?\s+(?:one\s+)?(?=[A-Z])"
+    r")"
+    r"\s*[:\-]?\s*(?i:one\s+|the\s+)?"
+)
+
+#: A comma segment opening with one of these describes the previous person
+#: rather than introducing a new one.
+_ATTRIBUTE_SEGMENT = re.compile(
+    r"^\s*(?i:age[ds]?\b|approximately\b|s/o\b|d/o\b|w/o\b|h/o\b|r/o\b"
+    r"|resident\b|residing\b|with\b|who\b|whose\b|a\b|an\b|the\b|and\s+the\b"
+    r"|alias\b|aka\b|both\b|all\b|others?\b|unidentified\b|prior\b)"
+)
+
+_AGE_IN_SEGMENT = re.compile(r"(?i:age[ds]?)\s*(?:approximately\s*)?(\d{1,3})")
+
+#: Numbered list markers used for multiple accused: "(1) X, age 28, (2) Y".
+_LIST_MARKER = re.compile(r"\(\s*\d+\s*\)")
+
+#: Words that look like names but never are, in FIR prose.
+_NOT_A_NAME = {
+    "the", "one", "two", "three", "this", "that", "he", "she", "they",
+    "shri", "smt", "sri", "station", "house", "officer", "investigation",
+    "sections", "section", "total", "complainant", "district", "police",
+    "hospitalized", "post", "mortem", "forensic", "motive", "victim",
+    "deceased", "unknown", "accused", "arrested", "identified", "suspect",
+    "sub", "inspector", "constable", "court", "magistrate", "fir",
+}
+
+_PERSON_IN_CLAUSE = re.compile(
+    rf"(?P<name>{_NAME})"
+    rf"(?:\s+(?i:alias|aka|a\.k\.a\.?|@)\s+(?P<alias>{_NAME}))?"
+    rf"(?:,?\s*(?i:age)\s*(?i:approximately\s*)?(?P<age>\d{{1,3}}))?"
+)
+
+
+def _is_plausible_name(name: str) -> bool:
+    tokens = [t for t in name.split() if t]
+    if not tokens:
+        return False
+    if any(t.lower() in _NOT_A_NAME for t in tokens):
+        return False
+    # "... (arrested in FIR/2024/MR/014, Meerut)" must not yield an accused
+    # called Meerut. Places are never people.
+    if name in DISTRICTS_UP or name.title() in DISTRICTS_UP:
+        return False
+    return "PS" not in tokens
+
+
+def _attribute_near(text: str, name: str, pattern: str) -> str | None:
+    """Pull an attribute that appears shortly after a person's name."""
+    match = re.search(rf"{re.escape(name)}[^.]{{0,120}}?{pattern}", text)
+    return match.group(1).strip() if match else None
+
+
 def extract_accused(text: str) -> list[AccusedProfile]:
-    accused_list = []
-    accused_section = re.findall(
-        r'(?:accused|arrested|suspected|identified as|apprehended)[:\s]+(.+?)(?:\.|Sections|Sec\.)',
-        text, re.IGNORECASE | re.DOTALL
-    )
+    """Extract accused persons from FIR narrative text.
 
-    names_found = set()
+    Works clause-first: locate the fragment introducing the accused, then parse
+    each comma/"and"-separated person inside it. The previous implementation
+    matched a name immediately after the trigger word and stopped, so only the
+    first of several named accused was ever captured.
+    """
+    accused_list: list[AccusedProfile] = []
+    seen: set[str] = set()
 
-    patterns = [
-        re.compile(
-            r'(?:accused[^.]*?|arrested[^.]*?|identified as[^.]*?)'
-            r'(?:(?:\d\)\s*)|(?:\(\d\)\s*))?'
-            r'([A-Z][a-z]+(?:\s+(?:alias\s+)?[A-Z][a-z]+){0,3})'
-            r'(?:\s+alias\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*))?'
-            r'(?:,?\s*age\s*(?:approximately\s*)?(\d{1,3}))?',
-            re.IGNORECASE
-        ),
-        re.compile(
-            r'(?:\(\d\)|(?:^|\n)\s*\d\))\s*'
-            r'([A-Z][a-z]+(?:\s+(?:alias\s+)?[A-Z][a-z]+){0,3})'
-            r'(?:\s+alias\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*))?'
-            r'(?:,?\s*age\s*(?:approximately\s*)?(\d{1,3}))?',
-            re.IGNORECASE
-        ),
-        re.compile(
-            r"'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'\s*(?:who|is|was|has|had)",
-            re.IGNORECASE
-        ),
-    ]
+    def record(name: str, alias: str | None, age: int | None) -> None:
+        name = name.strip().strip("'\"")
+        if not _is_plausible_name(name) or name.lower() in seen:
+            return
+        seen.add(name.lower())
+        aliases = []
+        if alias:
+            alias = alias.strip().strip("'\"")
+            if _is_plausible_name(alias) and alias.lower() != name.lower():
+                aliases.append(alias)
+        accused_list.append(AccusedProfile(
+            name=name,
+            aliases=aliases,
+            age=age,
+            father_name=_attribute_near(
+                text, name,
+                rf"(?i:s/o|son\s+of)\s+(?:(?i:late\s+)?(?i:shri|smt\.?)\s+)?({_NAME})"),
+            address=_attribute_near(text, name, r"(?i:r/o)\s+([^,.]+)"),
+            id_marks=[m for m in [_attribute_near(
+                text, name, r"((?i:scar|tattoo|birthmark)[^,.]+)")] if m],
+        ))
 
-    for pattern in patterns:
-        for match in pattern.finditer(text):
-            name = match.group(1).strip() if match.group(1) else ""
-            if not name or name.lower() in {"the", "one", "two", "three", "this", "that"}:
-                continue
+    def parse_chunk(chunk: str) -> bool:
+        """Parse one person plus the attribute segments that follow them.
 
-            skip_words = {"Shri", "Smt", "Station", "House", "Officer", "Investigation",
-                          "Sections", "Total", "Complainant", "District", "Police"}
-            if any(w in name for w in skip_words):
-                continue
+        Returns whether a person was found, so callers can stop walking a
+        comma-separated run once it stops naming people.
+        """
+        segments = chunk.split(",")
+        match = _PERSON_IN_CLAUSE.match(segments[0].strip().lstrip("'\""))
+        if not match:
+            return False
+        age = match.group("age")
+        age = int(age) if age and age.isdigit() else None
+        # Walk the following comma segments only while they describe this
+        # person; the first non-attribute segment belongs to someone else.
+        for segment in segments[1:]:
+            if not _ATTRIBUTE_SEGMENT.match(segment):
+                break
+            if age is None:
+                found = _AGE_IN_SEGMENT.search(segment)
+                if found:
+                    age = int(found.group(1))
+        before = len(accused_list)
+        record(match.group("name"), match.group("alias"), age)
+        return len(accused_list) > before
 
-            name_key = name.lower().split("alias")[0].strip()
-            if name_key in names_found:
-                continue
-            names_found.add(name_key)
+    for trigger in _ACCUSED_TRIGGER.finditer(text):
+        rest = text[trigger.end():]
+        end = re.search(r"\.\s+[A-Z]|\bSections?\b|\bSec\.|$", rest)
+        clause = rest[:end.start()] if end else rest[:250]
 
-            alias = match.group(2).strip() if len(match.groups()) > 1 and match.group(2) else ""
-            age_str = match.group(3) if len(match.groups()) > 2 and match.group(3) else None
-            age = int(age_str) if age_str and age_str.isdigit() else None
-
-            aliases = [alias] if alias else []
-            if "alias" in name:
-                parts = re.split(r'\s+alias\s+', name, flags=re.IGNORECASE)
-                name = parts[0].strip()
-                if len(parts) > 1:
-                    aliases.append(parts[1].strip())
-
-            id_marks = []
-            scar_match = re.search(
-                rf'{re.escape(name)}.*?(scar[^,.]+|tattoo[^,.]+|birthmark[^,.]+)',
-                text, re.IGNORECASE
-            )
-            if scar_match:
-                id_marks.append(scar_match.group(1).strip())
-
-            addr_match = re.search(
-                rf'{re.escape(name)}[^.]*?R/o\s+([^,.]+)',
-                text, re.IGNORECASE
-            )
-            address = addr_match.group(1).strip() if addr_match else None
-
-            father_match = re.search(
-                rf'{re.escape(name)}[^.]*?S/o\s+(?:(?:Late\s+)?(?:Shri|Smt\.?)\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
-                text, re.IGNORECASE
-            )
-            father = father_match.group(1).strip() if father_match else None
-
-            accused_list.append(AccusedProfile(
-                name=name,
-                aliases=aliases,
-                age=age,
-                father_name=father,
-                address=address,
-                id_marks=id_marks,
-            ))
+        if _LIST_MARKER.search(clause):
+            # "(1) Guddu alias Guddu Khan, age 28, (2) Sunil Yadav, age 31"
+            for chunk in _LIST_MARKER.split(clause):
+                parse_chunk(chunk.strip())
+        else:
+            # "Bablu alias Bhura, Sunny alias Sonu" — commas separate people
+            # until one of them starts an attribute run.
+            parse_chunk(clause)
+            for chunk in re.split(r",|\band\b|;|—|--", clause)[1:]:
+                chunk = chunk.strip()
+                if _ATTRIBUTE_SEGMENT.match(chunk) or not parse_chunk(chunk):
+                    break
 
     return accused_list
 
 
+#: Honorifics that also disclose gender.
+_GENDER_BY_HONORIFIC = {"shri": "Male", "sri": "Male", "smt": "Female"}
+
+_COMPLAINANT = re.compile(
+    rf"(?i:complainant)\s*[:\-]?\s*"
+    rf"(?P<honorific>(?i:Shri|Sri|Smt\.?|Dr\.?|Mr\.?|Mrs\.?)\s+)?"
+    rf"(?P<name>{_NAME})"
+    rf"(?:,?\s*(?i:age)\s*(?P<age>\d{{1,3}}))?"
+    rf"(?:[^.]*?(?i:r/o)\s+(?P<address>[^,.]+))?"
+)
+
+_OTHER_VICTIM = re.compile(
+    rf"(?i:victim|injured|deceased)\s+"
+    rf"(?:(?i:Shri|Sri|Smt\.?|Dr\.?)\s+)?"
+    rf"(?P<name>{_NAME})"
+    rf"(?:\s*\((?i:age)\s*(?P<age>\d{{1,3}})\)|,?\s*\((?P<age2>\d{{1,3}})\))?"
+)
+
+
 def extract_victims(text: str) -> list[VictimProfile]:
-    victims = []
-    complainant_match = re.search(
-        r'Complainant:\s*(?:Shri|Smt\.?|Dr\.?)\s+'
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4})'
-        r'(?:,?\s*age\s*(\d{1,3}))?'
-        r'(?:.*?([MFTO]|male|female))?'
-        r'(?:.*?R/o\s+([^,.]+))?',
-        text, re.IGNORECASE
-    )
-    if complainant_match:
-        name = complainant_match.group(1).strip()
-        age_str = complainant_match.group(2)
-        addr = complainant_match.group(4)
+    """Extract the complainant and any separately named victims."""
+    victims: list[VictimProfile] = []
+    seen: set[str] = set()
 
-        gender = None
-        if "Smt." in text[:text.find(name) + len(name)] or "W/o" in text[:text.find(name) + 200]:
-            gender = "Female"
-        elif "Shri" in text[:text.find(name) + len(name)] or "S/o" in text[:text.find(name) + 200]:
-            gender = "Male"
-
+    def add(name: str, age: str | None = None, gender: str | None = None,
+            address: str | None = None) -> None:
+        name = name.strip()
+        if not _is_plausible_name(name) or name.lower() in seen:
+            return
+        seen.add(name.lower())
         victims.append(VictimProfile(
             name=name,
-            age=int(age_str) if age_str else None,
+            age=int(age) if age and age.isdigit() else None,
             gender=gender,
-            address=addr.strip() if addr else None,
+            address=address.strip() if address else None,
         ))
 
-    victim_matches = re.finditer(
-        r'(?:victim|injured|deceased)\s+(?:Shri|Smt\.?|Dr\.?)?\s*'
-        r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})'
-        r'(?:\s*\(age\s*(\d+)\))?',
-        text, re.IGNORECASE
-    )
-    for m in victim_matches:
-        victims.append(VictimProfile(
-            name=m.group(1).strip(),
-            age=int(m.group(2)) if m.group(2) else None,
-        ))
+    match = _COMPLAINANT.search(text)
+    if match:
+        honorific = (match.group("honorific") or "").strip().rstrip(".").lower()
+        gender = _GENDER_BY_HONORIFIC.get(honorific)
+        if gender is None:
+            # Fall back to the relationship marker following the name.
+            tail = text[match.end("name"):match.end("name") + 200]
+            if re.search(r"(?i:\bW/o\b|\bD/o\b)", tail):
+                gender = "Female"
+            elif re.search(r"(?i:\bS/o\b)", tail):
+                gender = "Male"
+        add(match.group("name"), match.group("age"), gender, match.group("address"))
+
+    for match in _OTHER_VICTIM.finditer(text):
+        add(match.group("name"), match.group("age") or match.group("age2"))
 
     return victims
 
@@ -311,7 +386,16 @@ def extract_ipc_sections(text: str) -> list[str]:
 
 
 def extract_phone_numbers(text: str) -> list[str]:
-    return PHONE_PATTERN.findall(text)
+    """Indian mobile numbers, normalised to the 10-digit national number.
+
+    The raw matches carry an optional "+91-" prefix, so the same number written
+    two ways compared as two different numbers — which defeats the point of
+    extracting them for cross-FIR correlation.
+    """
+    seen: dict[str, None] = {}
+    for match in PHONE_PATTERN.finditer(text):
+        seen.setdefault(re.sub(r"\D", "", match.group(0))[-10:], None)
+    return list(seen)
 
 
 def extract_vehicles(text: str) -> list[str]:
