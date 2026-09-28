@@ -134,9 +134,15 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     context: Optional[str] = None
+    #: Prior turns, so the assistant can resolve follow-ups like "and in Agra?".
+    history: list[ChatMessage] = []
 
 
 class ChatResponse(BaseModel):
     response: str
     entities_referenced: list[str] = []
     firs_referenced: list[str] = []
+    #: Which engine produced the answer, so the UI can say so rather than
+    #: passing a computed fallback off as a model response.
+    source: str = "analysis"
+    model: Optional[str] = None

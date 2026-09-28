@@ -11,17 +11,20 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import Counter
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, ORJSONResponse
+from fastapi.responses import FileResponse, ORJSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 import database as db
 import intel_qa
+import llm_client
 from bob_client import (
     chat_with_bob,
     generate_intelligence_report,
@@ -198,8 +201,13 @@ async def lifespan(app: FastAPI):
     print(f"Analysed {analysis_cache.total_firs_processed} FIRs — "
           f"{len(analysis_cache.repeat_offenders)} repeat offenders, "
           f"{len(networks_cache)} networks")
-    print(f"Language model: "
-          f"{'IBM watsonx.ai' if watsonx_configured() else 'rule-based (no credentials)'}")
+    status = _llm_status()
+    print(f"Assistant: {status['source']}"
+          f"{' · ' + status['model'] if status['model'] else ''}"
+          f"{' (streaming)' if status['engine'] == 'llm' else ''}")
+    if status["engine"] == "analysis":
+        print("           No LLM configured — answers are computed from the corpus. "
+              "Set ZAI_API_KEY to enable the AI assistant.")
     print(f"Storage: {backend}")
     print("\nDashboard: http://localhost:8000")
     print("API docs:  http://localhost:8000/docs")
@@ -246,11 +254,17 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/health", tags=["meta"])
 async def health():
+    status = _llm_status()
     return {
         "status": "ok" if analysis_cache else "starting",
         "storage": db.backend_name(),
         "persistent": db.is_persistent(),
-        "language_model": "watsonx.ai" if watsonx_configured() else "rule-based",
+        "language_model": status["source"],
+        "model": status["model"],
+        "ai_enabled": status["engine"] != "analysis",
+        "streaming": status["engine"] == "llm",
+        "llm": llm_client.describe(),
+        "watsonx_configured": watsonx_configured(),
         "firs_in_db": await db.count_firs(),
         "firs_analyzed": analysis_cache.total_firs_processed if analysis_cache else 0,
         "repeat_offenders": len(analysis_cache.repeat_offenders) if analysis_cache else 0,
@@ -433,48 +447,268 @@ async def get_crime_trends():
     return _require_analysis().crime_trend
 
 
+@app.get("/api/crime-types/{crime_type}", tags=["analytics"])
+async def get_crime_type_detail(crime_type: str, sample: int = Query(8, ge=1, le=50)):
+    """Everything the dashboard needs to drill into one crime type.
+
+    Backs the click-through on the crime distribution chart: selecting a slice
+    should answer "so what is actually in that slice?" without a round trip per
+    panel.
+    """
+    result = _require_analysis()
+    records = [r for r in result.fir_records
+               if (r.crime_type.value if r.crime_type else "other") == crime_type]
+    if not records:
+        raise HTTPException(404, f"No FIRs classified as '{crime_type}'")
+
+    total = result.total_firs_processed or 1
+    severities = [r.severity_score or 0.0 for r in records]
+    severity_distribution = Counter(_severity_band(s) for s in severities)
+
+    districts = Counter(r.district for r in records)
+    stations = Counter(f"{r.police_station} ({r.district})" for r in records)
+    monthly = Counter(r.date_filed.strftime("%Y-%m") for r in records)
+    sections = Counter(s for r in records for s in r.ipc_sections)
+    methods = Counter(r.modus_operandi.approach_method for r in records
+                      if r.modus_operandi and r.modus_operandi.approach_method)
+    weapons = Counter(r.modus_operandi.weapon_used for r in records
+                      if r.modus_operandi and r.modus_operandi.weapon_used)
+    times = Counter(r.modus_operandi.time_of_day for r in records
+                    if r.modus_operandi and r.modus_operandi.time_of_day)
+
+    numbers = {r.fir_number for r in records}
+    offenders = [
+        {
+            "name": o.name,
+            "aliases": o.aliases,
+            "risk_level": o.risk_level.value,
+            "linked_firs_in_type": sorted(numbers & set(o.linked_firs)),
+            "total_incidents": o.total_incidents,
+            "districts": o.districts,
+        }
+        for o in result.repeat_offenders if crime_type in o.crime_types
+    ]
+    offenders.sort(key=lambda o: -len(o["linked_firs_in_type"]))
+
+    networks = [
+        {"name": n["name"], "fir_count": n["fir_count"],
+         "districts": n["districts"], "risk_level": n["risk_level"],
+         "matching_firs": sorted(numbers & set(n["fir_numbers"]))}
+        for n in networks_cache if numbers & set(n["fir_numbers"])
+    ]
+
+    top_severity = sorted(records, key=lambda r: -(r.severity_score or 0))[:sample]
+    return {
+        "crime_type": crime_type,
+        "label": crime_type.replace("_", " "),
+        "total": len(records),
+        "share_percent": round(len(records) / total * 100, 1),
+        "avg_severity": round(sum(severities) / len(severities), 1),
+        "max_severity": round(max(severities), 1),
+        "severity_distribution": {band: severity_distribution.get(band, 0)
+                                  for band in ("critical", "high", "medium", "low")},
+        "accused_count": sum(len(r.accused) for r in records),
+        "victim_count": sum(len(r.victims) for r in records),
+        "date_range": {"start": str(min(r.date_filed for r in records)),
+                       "end": str(max(r.date_filed for r in records))},
+        "districts": [{"name": k, "count": v} for k, v in districts.most_common()],
+        "stations": [{"name": k, "count": v} for k, v in stations.most_common(8)],
+        "monthly_trend": dict(sorted(monthly.items())),
+        "ipc_sections": [{"section": k, "count": v} for k, v in sections.most_common(10)],
+        "modus_operandi": [{"method": k, "count": v} for k, v in methods.most_common(6)],
+        "weapons": [{"weapon": k, "count": v} for k, v in weapons.most_common(6)],
+        "time_of_day": dict(times.most_common()),
+        "repeat_offenders": offenders[:10],
+        "networks": networks,
+        "top_firs": [_fir_payload(r) for r in top_severity],
+    }
+
+
 # ── Conversational + reporting ─────────────────────────────────────────────
 
 
-@app.post("/api/chat", response_model=ChatResponse, tags=["bob"])
+def _llm_status() -> dict:
+    """Which engine will answer, and why."""
+    info = llm_client.describe()
+    if info["configured"]:
+        return {"source": info["provider"], "model": info["model"],
+                "engine": "llm"}
+    if watsonx_configured():
+        return {"source": "IBM watsonx.ai", "model": os.getenv(
+            "WATSONX_MODEL", "ibm/granite-3-8b-instruct"), "engine": "watsonx"}
+    return {"source": "rule-based analysis", "model": None, "engine": "analysis"}
+
+
+async def _report_metadata(result: AnalysisResult) -> dict:
+    return {
+        "total_firs": result.total_firs_processed,
+        "crime_breakdown": await db.get_crime_breakdown(),
+        "district_breakdown": await db.get_district_breakdown(),
+        "repeat_offender_count": len(result.repeat_offenders),
+        "districts": sorted({f.district for f in result.fir_records}),
+        "patterns": [n["name"] for n in networks_cache],
+        "stations_analysed": len(result.station_summaries),
+    }
+
+
+def _sse(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+@app.post("/api/chat", response_model=ChatResponse, tags=["assistant"])
 async def chat_endpoint(req: ChatRequest):
+    """Answer a question about the corpus (buffered).
+
+    The deterministic answer is computed first and handed to the model as
+    grounding, so a model answer is constrained by the detection pipeline
+    rather than free to invent offenders — and if no model is configured or the
+    call fails, that same computed answer is returned instead of nothing.
+    """
     result = _require_analysis()
     message = (req.message or "").strip()
     if not message:
         raise HTTPException(400, "message must not be empty")
 
     grounded = intel_qa.answer_question(message, result, networks_cache)
-    context = await get_analysis_context(result, networks_cache)
-    response = await chat_with_bob(message, context, deterministic_answer=grounded)
+    facts = await get_analysis_context(result, networks_cache)
+    status = _llm_status()
+    response, source, model = grounded, "rule-based analysis", None
+
+    if llm_client.is_configured():
+        messages = llm_client.build_chat_messages(
+            message, facts, grounded,
+            history=[m.model_dump() for m in req.history])
+        try:
+            response = await llm_client.complete(messages, max_tokens=1200)
+            source, model = status["source"], status["model"]
+        except llm_client.LLMError as exc:
+            print(f"LLM chat failed, using computed answer: {exc}")
+            source = f"rule-based analysis ({status['source']} unavailable)"
+    elif watsonx_configured():
+        response = await chat_with_bob(message, facts, deterministic_answer=grounded)
+        source, model = status["source"], status["model"]
 
     referenced = [f.fir_number for f in result.fir_records if f.fir_number in response]
     entities = [o.name for o in result.repeat_offenders if o.name in response]
-    return ChatResponse(
-        response=response,
-        firs_referenced=referenced,
-        entities_referenced=entities,
-    )
+    return ChatResponse(response=response, firs_referenced=referenced,
+                        entities_referenced=entities, source=source, model=model)
 
 
-@app.get("/api/report", tags=["bob"])
-async def generate_report():
+@app.post("/api/chat/stream", tags=["assistant"])
+async def chat_stream(req: ChatRequest):
+    """Same as /api/chat, streamed token by token over SSE."""
+    result = _require_analysis()
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(400, "message must not be empty")
+
+    grounded = intel_qa.answer_question(message, result, networks_cache)
+    facts = await get_analysis_context(result, networks_cache)
+    status = _llm_status()
+
+    async def events():
+        yield _sse("start", status)
+        collected: list[str] = []
+
+        if llm_client.is_configured():
+            messages = llm_client.build_chat_messages(
+                message, facts, grounded,
+                history=[m.model_dump() for m in req.history])
+            try:
+                async for piece in llm_client.stream(messages, max_tokens=1200):
+                    collected.append(piece)
+                    yield _sse("delta", {"text": piece})
+            except llm_client.LLMError as exc:
+                # Fall back mid-stream rather than leaving the user with a
+                # half-written answer and no explanation.
+                collected.clear()
+                yield _sse("fallback", {"reason": str(exc)[:300]})
+                yield _sse("delta", {"text": grounded})
+                collected.append(grounded)
+        else:
+            yield _sse("delta", {"text": grounded})
+            collected.append(grounded)
+
+        answer = "".join(collected)
+        yield _sse("done", {
+            "firs_referenced": [f.fir_number for f in result.fir_records
+                                if f.fir_number in answer],
+            "entities_referenced": [o.name for o in result.repeat_offenders
+                                    if o.name in answer],
+        })
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.get("/api/report", tags=["assistant"])
+async def generate_report(focus: str = Query("", max_length=120)):
+    """Generate an intelligence report from the current analysis.
+
+    Regenerated on every request — the corpus changes as FIRs are ingested, so
+    a cached report goes stale the moment someone uploads a batch.
+    """
     result = _require_analysis()
     grounded = intel_qa.build_report(result, networks_cache)
-    metadata = {
-        "total_firs": result.total_firs_processed,
-        "crime_breakdown": await db.get_crime_breakdown(),
-        "repeat_offender_count": len(result.repeat_offenders),
-        "districts": sorted({f.district for f in result.fir_records}),
-        "patterns": [n["name"] for n in networks_cache],
-    }
-    report = await generate_intelligence_report(metadata,
-                                                deterministic_report=grounded)
+    metadata = await _report_metadata(result)
+    status = _llm_status()
+    report, source = grounded, "rule-based analysis"
+
+    if llm_client.is_configured():
+        try:
+            report = await llm_client.complete(
+                llm_client.build_report_messages(grounded, metadata, focus),
+                max_tokens=3000, temperature=0.35)
+            source = status["source"]
+        except llm_client.LLMError as exc:
+            print(f"LLM report failed, using computed report: {exc}")
+            source = f"rule-based analysis ({status['source']} unavailable)"
+    elif watsonx_configured():
+        report = await generate_intelligence_report(
+            metadata, deterministic_report=grounded)
+        source = status["source"]
+
     return {
         "report": report,
+        "analysis": grounded,
         "metadata": metadata,
-        "source": "watsonx.ai" if watsonx_configured() else "rule-based analysis",
-        "generated_at": result.generated_at.isoformat(),
+        "focus": focus,
+        "source": source,
+        "model": status["model"],
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "corpus_analysed_at": result.generated_at.isoformat(),
     }
+
+
+@app.get("/api/report/stream", tags=["assistant"])
+async def report_stream(focus: str = Query("", max_length=120)):
+    """Stream the intelligence report as the model writes it."""
+    result = _require_analysis()
+    grounded = intel_qa.build_report(result, networks_cache)
+    metadata = await _report_metadata(result)
+    status = _llm_status()
+
+    async def events():
+        yield _sse("start", {**status, "metadata": metadata, "focus": focus,
+                             "generated_at": datetime.now(timezone.utc).isoformat()})
+        if llm_client.is_configured():
+            try:
+                async for piece in llm_client.stream(
+                    llm_client.build_report_messages(grounded, metadata, focus),
+                    max_tokens=3000, temperature=0.35,
+                ):
+                    yield _sse("delta", {"text": piece})
+            except llm_client.LLMError as exc:
+                yield _sse("fallback", {"reason": str(exc)[:300]})
+                yield _sse("delta", {"text": grounded})
+        else:
+            yield _sse("delta", {"text": grounded})
+        yield _sse("done", {"analysis": grounded})
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/upload-firs", tags=["firs"])

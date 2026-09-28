@@ -76,6 +76,165 @@ async function apiGet(path, signal) {
   }
   return res.json();
 }
+
+/**
+ * Consume a server-sent-event stream over fetch.
+ *
+ * `EventSource` only issues GET requests and cannot send a JSON body, so the
+ * chat stream (a POST carrying the question and conversation history) has to be
+ * read off the response body and framed by hand.
+ */
+async function streamSSE(path, {
+  method = 'GET',
+  body,
+  signal,
+  onEvent
+}) {
+  const res = await fetch(API + path, {
+    method,
+    headers: body ? {
+      'Content-Type': 'application/json'
+    } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal
+  });
+  if (!res.ok || !res.body) throw new Error(`Stream failed: HTTP ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const {
+      done,
+      value
+    } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {
+      stream: true
+    });
+
+    // Frames are separated by a blank line; keep the trailing partial frame.
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+    for (const frame of frames) {
+      let event = 'message';
+      let data = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();else if (line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      try {
+        onEvent(event, JSON.parse(data));
+      } catch (e) {/* keep-alive or partial frame */}
+    }
+  }
+}
+const GREETING = {
+  role: 'assistant',
+  greeting: true,
+  content: 'I am the FIR Intelligence assistant. I answer from the analysed corpus — ' + 'crime patterns, repeat offenders, criminal networks, station caseloads and ' + 'individual FIRs.\n\nAsk about a specific FIR number, a named accused, a ' + 'district, or pick a suggestion.'
+};
+const CHAT_SUGGESTIONS = ['What are the top crime patterns?', 'Who are the repeat offenders?', 'Which districts have the highest caseload?', 'Show the organised crime networks', 'Which FIRs are most severe?', 'Summarise station activity'];
+
+/**
+ * Streaming chat state. Owned by the app shell so the conversation is shared
+ * between the Ask Bob tab and the floating widget, and survives tab switches.
+ */
+function useChatEngine() {
+  const [messages, setMessages] = useState([GREETING]);
+  const [busy, setBusy] = useState(false);
+  const abortRef = useRef(null);
+  // History is read inside an async callback; a ref avoids re-creating `send`
+  // on every message and reading a stale list.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const patchLast = useCallback(patch => {
+    setMessages(prev => {
+      const next = prev.slice();
+      const last = next[next.length - 1];
+      next[next.length - 1] = typeof patch === 'function' ? patch(last) : {
+        ...last,
+        ...patch
+      };
+      return next;
+    });
+  }, []);
+  const send = useCallback(async text => {
+    const message = String(text ?? '').trim();
+    if (!message || abortRef.current) return;
+    const history = messagesRef.current.filter(m => !m.greeting && !m.error && m.content).slice(-8).map(m => ({
+      role: m.role,
+      content: m.content
+    }));
+    setMessages(prev => [...prev, {
+      role: 'user',
+      content: message
+    }, {
+      role: 'assistant',
+      content: '',
+      streaming: true
+    }]);
+    setBusy(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      await streamSSE('/chat/stream', {
+        method: 'POST',
+        body: {
+          message,
+          history
+        },
+        signal: controller.signal,
+        onEvent: (event, data) => {
+          if (event === 'start') patchLast({
+            source: data.source,
+            model: data.model
+          });else if (event === 'delta') patchLast(m => ({
+            ...m,
+            content: m.content + data.text
+          }));else if (event === 'fallback') patchLast({
+            fallback: data.reason,
+            content: ''
+          });else if (event === 'done') patchLast({
+            streaming: false,
+            firs: data.firs_referenced || []
+          });
+        }
+      });
+      patchLast({
+        streaming: false
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        patchLast(m => ({
+          ...m,
+          streaming: false,
+          content: m.content + (m.content ? '\n\n[stopped]' : '[stopped]')
+        }));
+      } else {
+        patchLast({
+          streaming: false,
+          error: true,
+          content: `Could not reach the intelligence service: ${err.message}`
+        });
+      }
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+    }
+  }, [patchLast]);
+  const stop = useCallback(() => abortRef.current?.abort(), []);
+  const reset = useCallback(() => {
+    abortRef.current?.abort();
+    setMessages([GREETING]);
+  }, []);
+  return {
+    messages,
+    busy,
+    send,
+    stop,
+    reset
+  };
+}
 function useApi(path, deps = []) {
   const [state, setState] = useState({
     data: null,
@@ -303,15 +462,416 @@ function SectionCard({
   }, subtitle)), actions), children);
 }
 
+// ── Crime type drill-down ──────────────────────────────────────────────────
+
+/** Small labelled bar list — used for districts, stations, sections, MO. */
+function MiniBars({
+  rows,
+  keyField,
+  max,
+  color = 'var(--blue)'
+}) {
+  if (!rows?.length) return /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 12
+    }
+  }, "Not recorded.");
+  const top = max || rows[0].count || 1;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6
+    }
+  }, rows.map((row, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: '0 0 46%',
+      fontSize: 12,
+      overflow: 'hidden',
+      textOverflow: 'ellipsis',
+      whiteSpace: 'nowrap'
+    },
+    title: row[keyField]
+  }, row[keyField]), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      background: 'var(--bg2)',
+      borderRadius: 12,
+      height: 16,
+      overflow: 'hidden'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      height: '100%',
+      borderRadius: 12,
+      background: color,
+      width: `${Math.max(row.count / top * 100, 8)}%`
+    }
+  })), /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: '0 0 26px',
+      textAlign: 'right',
+      fontSize: 12,
+      fontWeight: 700
+    }
+  }, row.count))));
+}
+
+/**
+ * Everything behind one slice of the crime distribution chart.
+ * Fetched on demand rather than shipped with the dashboard payload, which
+ * would mean sending every breakdown for every crime type on first load.
+ */
+function CrimeDrilldown({
+  crimeType,
+  onClose,
+  onOpenFIR
+}) {
+  const state = useApi(`/crime-types/${encodeURIComponent(crimeType)}`);
+  const closeRef = useRef(null);
+  useEffect(() => {
+    closeRef.current?.focus();
+  }, [crimeType]);
+  return /*#__PURE__*/React.createElement("section", {
+    className: "glass p-5 fade-in",
+    "aria-live": "polite",
+    style: {
+      borderColor: 'rgba(91,155,255,.4)'
+    }
+  }, /*#__PURE__*/React.createElement(Async, {
+    state: state
+  }, d => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      alignItems: 'flex-start',
+      gap: 12,
+      flexWrap: 'wrap',
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700,
+      textTransform: 'capitalize'
+    }
+  }, d.label), /*#__PURE__*/React.createElement("p", {
+    className: "muted"
+  }, d.total, " FIRs \xB7 ", d.share_percent, "% of the corpus \xB7", ' ', d.date_range.start, " \u2192 ", d.date_range.end)), /*#__PURE__*/React.createElement("button", {
+    ref: closeRef,
+    className: "btn btn-ghost",
+    onClick: onClose
+  }, "Close \xD7")), /*#__PURE__*/React.createElement("div", {
+    className: "metric-grid",
+    style: {
+      marginBottom: 16
+    }
+  }, [['FIRs', d.total, 'var(--blue)'], ['Avg severity', d.avg_severity, 'var(--amber)'], ['Peak severity', d.max_severity, 'var(--red)'], ['Accused named', d.accused_count, 'var(--purple)'], ['Victims', d.victim_count, 'var(--green)'], ['Districts', d.districts.length, 'var(--cyan)']].map(([k, v, c]) => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    style: {
+      padding: 10,
+      borderRadius: 8,
+      background: 'var(--bg2)',
+      textAlign: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, k), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontWeight: 700,
+      fontSize: 19,
+      color: c
+    }
+  }, v)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 14,
+      flexWrap: 'wrap',
+      marginBottom: 16
+    }
+  }, ['critical', 'high', 'medium', 'low'].map(band => /*#__PURE__*/React.createElement("span", {
+    key: band,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      fontSize: 12,
+      color: 'var(--text2)'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    "aria-hidden": "true",
+    style: {
+      width: 10,
+      height: 10,
+      borderRadius: 3,
+      background: RISK_COLOR[band]
+    }
+  }), band, ": ", d.severity_distribution[band]))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fit,minmax(260px,1fr))',
+      gap: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8,
+      color: 'var(--cyan)'
+    }
+  }, "Districts"), /*#__PURE__*/React.createElement(MiniBars, {
+    rows: d.districts.slice(0, 7),
+    keyField: "name",
+    color: "var(--cyan)"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8,
+      color: 'var(--blue)'
+    }
+  }, "Stations"), /*#__PURE__*/React.createElement(MiniBars, {
+    rows: d.stations.slice(0, 7),
+    keyField: "name",
+    color: "var(--blue)"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8,
+      color: 'var(--purple)'
+    }
+  }, "Sections invoked"), /*#__PURE__*/React.createElement(MiniBars, {
+    rows: d.ipc_sections.slice(0, 7),
+    keyField: "section",
+    color: "var(--purple)"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8,
+      color: 'var(--amber)'
+    }
+  }, "Modus operandi"), /*#__PURE__*/React.createElement(MiniBars, {
+    rows: d.modus_operandi,
+    keyField: "method",
+    color: "var(--amber)"
+  }), d.weapons.length > 0 && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      margin: '12px 0 8px',
+      color: 'var(--red)'
+    }
+  }, "Weapons"), /*#__PURE__*/React.createElement(MiniBars, {
+    rows: d.weapons,
+    keyField: "weapon",
+    color: "var(--red)"
+  })))), Object.keys(d.monthly_trend).length > 1 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8
+    }
+  }, "Monthly trend"), /*#__PURE__*/React.createElement(ResponsiveContainer, {
+    width: "100%",
+    height: 150
+  }, /*#__PURE__*/React.createElement(AreaChart, {
+    data: Object.entries(d.monthly_trend).map(([m, v]) => ({
+      month: m,
+      count: v
+    }))
+  }, /*#__PURE__*/React.createElement(CartesianGrid, {
+    strokeDasharray: "3 3",
+    stroke: "#1c2748"
+  }), /*#__PURE__*/React.createElement(XAxis, {
+    dataKey: "month",
+    stroke: "#9dafd4",
+    tick: {
+      fontSize: 10
+    }
+  }), /*#__PURE__*/React.createElement(YAxis, {
+    stroke: "#9dafd4",
+    tick: {
+      fontSize: 10
+    },
+    width: 28,
+    allowDecimals: false
+  }), /*#__PURE__*/React.createElement(Tooltip, CHART_TOOLTIP), /*#__PURE__*/React.createElement(Area, {
+    type: "monotone",
+    dataKey: "count",
+    stroke: "#5b9bff",
+    fill: "rgba(91,155,255,.18)",
+    strokeWidth: 2,
+    isAnimationActive: false
+  })))), d.repeat_offenders.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8,
+      color: 'var(--red)'
+    }
+  }, "Repeat offenders in this category"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6
+    }
+  }, d.repeat_offenders.map((o, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 10,
+      flexWrap: 'wrap',
+      padding: '8px 10px',
+      borderRadius: 8,
+      background: 'var(--bg2)'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontWeight: 700,
+      fontSize: 13
+    }
+  }, o.name), o.aliases?.length > 0 && /*#__PURE__*/React.createElement("span", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, "alias ", o.aliases.join(', ')), /*#__PURE__*/React.createElement("span", {
+    className: `badge badge-${o.risk_level}`
+  }, o.risk_level), /*#__PURE__*/React.createElement("span", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, o.linked_firs_in_type.length, " of ", o.total_incidents, " FIRs here \xB7", ' ', o.districts.join(', ')))))), d.networks.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8,
+      color: 'var(--green)'
+    }
+  }, "Networks involved"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: 8
+    }
+  }, d.networks.map((n, i) => /*#__PURE__*/React.createElement("span", {
+    key: i,
+    style: {
+      padding: '6px 12px',
+      borderRadius: 10,
+      background: 'var(--bg2)',
+      fontSize: 12,
+      border: '1px solid var(--border)'
+    }
+  }, /*#__PURE__*/React.createElement("strong", null, n.name), /*#__PURE__*/React.createElement("span", {
+    className: "muted"
+  }, " \xB7 ", n.matching_firs.length, " of ", n.fir_count, " FIRs"))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 18
+    }
+  }, /*#__PURE__*/React.createElement("h3", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      marginBottom: 8
+    }
+  }, "Highest-severity FIRs"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 6
+    }
+  }, d.top_firs.map(f => /*#__PURE__*/React.createElement("button", {
+    key: f.fir_number,
+    className: "row-card",
+    style: {
+      padding: '10px 12px'
+    },
+    onClick: () => onOpenFIR(f.fir_number)
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 8,
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center',
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: 'ui-monospace,Menlo,monospace',
+      color: 'var(--blue)',
+      fontWeight: 700,
+      fontSize: 12
+    }
+  }, f.fir_number), /*#__PURE__*/React.createElement("span", {
+    className: `badge badge-${f.severity}`
+  }, f.severity)), /*#__PURE__*/React.createElement("span", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, f.date, " \xB7 ", f.district, " \xB7 ", f.police_station)), /*#__PURE__*/React.createElement("p", {
+    className: "muted clamp-2",
+    style: {
+      marginTop: 5,
+      fontSize: 12
+    }
+  }, f.summary)))), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11,
+      marginTop: 8
+    }
+  }, "Select an FIR to open it in the FIR Records tab.")))));
+}
+
 // ── Dashboard ──────────────────────────────────────────────────────────────
 function Dashboard({
-  state
+  state,
+  onOpenFIR
 }) {
+  const [selectedCrime, setSelectedCrime] = useState(null);
   return /*#__PURE__*/React.createElement(Async, {
     state: state
   }, data => {
-    const crimeData = Object.entries(data.crime_breakdown || {}).map(([name, value]) => ({
-      name: label(name),
+    // Keep the raw key alongside the display label so a click can address the
+    // API without having to reverse the prettified name.
+    const crimeData = Object.entries(data.crime_breakdown || {}).map(([key, value]) => ({
+      name: label(key),
+      key,
       value
     })).sort((a, b) => b.value - a.value);
     const districtData = Object.entries(data.district_breakdown || {}).map(([name, value]) => ({
@@ -409,7 +969,8 @@ function Dashboard({
     }), l, ": ", sev[l] || 0)))), /*#__PURE__*/React.createElement("div", {
       className: "grid-2"
     }, /*#__PURE__*/React.createElement(SectionCard, {
-      title: "Crime Type Distribution"
+      title: "Crime Type Distribution",
+      subtitle: "Select a segment to break that offence down"
     }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
       width: "100%",
       height: 280
@@ -438,11 +999,36 @@ function Dashboard({
         stroke: '#5b9bff',
         strokeWidth: 1
       },
-      isAnimationActive: false
-    }, crimeData.map((_, i) => /*#__PURE__*/React.createElement(Cell, {
+      isAnimationActive: false,
+      onClick: slice => setSelectedCrime(current => current === slice.key ? null : slice.key),
+      style: {
+        cursor: 'pointer',
+        outline: 'none'
+      }
+    }, crimeData.map((entry, i) => /*#__PURE__*/React.createElement(Cell, {
       key: i,
-      fill: COLORS[i % COLORS.length]
-    }))), /*#__PURE__*/React.createElement(Tooltip, CHART_TOOLTIP)))), /*#__PURE__*/React.createElement(SectionCard, {
+      fill: COLORS[i % COLORS.length],
+      stroke: selectedCrime === entry.key ? '#edf2ff' : undefined,
+      strokeWidth: selectedCrime === entry.key ? 2.5 : 0,
+      fillOpacity: selectedCrime && selectedCrime !== entry.key ? .35 : 1
+    }))), /*#__PURE__*/React.createElement(Tooltip, CHART_TOOLTIP))), /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: 5,
+        marginTop: 10
+      }
+    }, crimeData.map((entry, i) => /*#__PURE__*/React.createElement("button", {
+      key: entry.key,
+      className: "chip chip-btn",
+      "aria-pressed": selectedCrime === entry.key,
+      onClick: () => setSelectedCrime(selectedCrime === entry.key ? null : entry.key),
+      style: {
+        borderColor: selectedCrime === entry.key ? COLORS[i % COLORS.length] : 'var(--border)',
+        color: COLORS[i % COLORS.length],
+        background: selectedCrime === entry.key ? COLORS[i % COLORS.length] + '25' : 'transparent'
+      }
+    }, entry.name, " ", entry.value)))), /*#__PURE__*/React.createElement(SectionCard, {
       title: "FIRs by District"
     }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
       width: "100%",
@@ -475,7 +1061,11 @@ function Dashboard({
     }, districtData.map((_, i) => /*#__PURE__*/React.createElement(Cell, {
       key: i,
       fill: COLORS[i % COLORS.length]
-    }))))))), /*#__PURE__*/React.createElement(SectionCard, {
+    }))))))), selectedCrime && /*#__PURE__*/React.createElement(CrimeDrilldown, {
+      crimeType: selectedCrime,
+      onClose: () => setSelectedCrime(null),
+      onOpenFIR: onOpenFIR
+    }), /*#__PURE__*/React.createElement(SectionCard, {
       title: "Monthly Crime Trend"
     }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
       width: "100%",
@@ -572,15 +1162,26 @@ function Dashboard({
 
 // ── FIR records ────────────────────────────────────────────────────────────
 const PAGE_SIZE = 20;
-function FIRList() {
-  const [search, setSearch] = useState('');
-  const [query, setQuery] = useState('');
+function FIRList({
+  initialQuery
+}) {
+  const [search, setSearch] = useState(initialQuery || '');
+  const [query, setQuery] = useState(initialQuery || '');
   const [crimeType, setCrimeType] = useState('');
   const [district, setDistrict] = useState('');
   const [severity, setSeverity] = useState('');
   const [offset, setOffset] = useState(0);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(initialQuery || null);
   const filters = useApi('/filters');
+
+  // Arriving from a drill-down: search for that FIR and expand it.
+  useEffect(() => {
+    if (!initialQuery) return;
+    setSearch(initialQuery);
+    setQuery(initialQuery);
+    setSelected(initialQuery);
+    setOffset(0);
+  }, [initialQuery]);
 
   // Debounce so a keystroke does not fire a request per character.
   useEffect(() => {
@@ -1668,70 +2269,116 @@ function NetworkView() {
   }))));
 }
 
-// ── Bob chat ───────────────────────────────────────────────────────────────
-const GREETING = {
-  role: 'assistant',
-  content: 'I am the FIR Intelligence assistant. I answer from the analysed corpus only — ' + 'crime patterns, repeat offenders, criminal networks, station caseloads and ' + 'individual FIRs.\n\nAsk about a specific FIR number, a named accused, a district, ' + 'or pick a suggestion below.'
-};
-function BobChat() {
-  const [messages, setMessages] = useState([GREETING]);
+// ── Chat ───────────────────────────────────────────────────────────────────
+
+/** One message bubble. Shared by the full tab and the floating widget. */
+function ChatBubble({
+  message,
+  compact
+}) {
+  const isUser = message.role === 'user';
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: isUser ? 'flex-end' : 'flex-start'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "chat-bubble",
+    style: {
+      maxWidth: compact ? '90%' : '72%',
+      padding: compact ? '10px 13px' : '12px 16px',
+      borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+      background: isUser ? 'var(--blue2)' : 'var(--card)',
+      border: message.error ? '1px solid rgba(251,90,117,.5)' : '1px solid var(--border)'
+    }
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "sr-only"
+  }, isUser ? 'You said' : 'Assistant said'), message.fallback && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 11,
+      color: 'var(--amber)',
+      marginBottom: 6
+    }
+  }, "Model unavailable \u2014 showing the computed analysis instead."), /*#__PURE__*/React.createElement("pre", {
+    style: {
+      fontSize: compact ? 12.5 : 13,
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      fontFamily: 'inherit',
+      margin: 0,
+      lineHeight: 1.55,
+      color: message.error ? 'var(--red)' : 'inherit'
+    }
+  }, message.content, message.streaming && /*#__PURE__*/React.createElement("span", {
+    className: "caret",
+    "aria-hidden": "true"
+  }, "\u258D")), !isUser && !message.streaming && message.source && !message.greeting && /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 10,
+      color: 'var(--text3)',
+      marginTop: 8
+    }
+  }, message.source, message.model ? ` · ${message.model}` : '')));
+}
+function ChatComposer({
+  chat,
+  inputRef,
+  compact
+}) {
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
+  const submit = e => {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || chat.busy) return;
+    setInput('');
+    chat.send(text);
+  };
+  return /*#__PURE__*/React.createElement("form", {
+    style: {
+      display: 'flex',
+      gap: 8
+    },
+    onSubmit: submit
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "sr-only",
+    htmlFor: compact ? 'dock-input' : 'chat-input'
+  }, "Ask about the FIR corpus"), /*#__PURE__*/React.createElement("input", {
+    id: compact ? 'dock-input' : 'chat-input',
+    ref: inputRef,
+    type: "text",
+    value: input,
+    onChange: e => setInput(e.target.value),
+    style: {
+      flex: 1,
+      minWidth: 0
+    },
+    placeholder: compact ? 'Ask about the corpus…' : 'Ask about offenders, networks, districts or an FIR number…'
+  }), chat.busy ? /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "btn btn-ghost",
+    onClick: chat.stop
+  }, "Stop") : /*#__PURE__*/React.createElement("button", {
+    type: "submit",
+    className: "btn btn-primary",
+    disabled: !input.trim(),
+    style: {
+      paddingLeft: compact ? 16 : 24,
+      paddingRight: compact ? 16 : 24
+    }
+  }, "Send"));
+}
+function ChatTranscript({
+  chat,
+  compact
+}) {
   const endRef = useRef(null);
-  const inputRef = useRef(null);
-  const suggestions = ['What are the top crime patterns?', 'Who are the repeat offenders?', 'Which districts have the highest caseload?', 'Show the organised crime networks', 'Which FIRs are most severe?', 'Summarise station activity'];
   useEffect(() => {
     endRef.current?.scrollIntoView({
       behavior: 'smooth',
       block: 'end'
     });
-  }, [messages, busy]);
-  const send = useCallback(async text => {
-    const message = (text ?? input).trim();
-    if (!message || busy) return;
-    setMessages(prev => [...prev, {
-      role: 'user',
-      content: message
-    }]);
-    setInput('');
-    setBusy(true);
-    try {
-      const res = await fetch(API + '/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          message
-        })
-      });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
-      const data = await res.json();
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: data.response || 'No answer returned.',
-        firs: data.firs_referenced || []
-      }]);
-    } catch (err) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        error: true,
-        content: `Could not reach the intelligence service: ${err.message}`
-      }]);
-    } finally {
-      setBusy(false);
-      inputRef.current?.focus();
-    }
-  }, [input, busy]);
+  }, [chat.messages, chat.busy]);
   return /*#__PURE__*/React.createElement("div", {
-    className: "fade-in",
-    style: {
-      display: 'flex',
-      flexDirection: 'column',
-      height: 'calc(100vh - 230px)',
-      minHeight: 420
-    }
-  }, /*#__PURE__*/React.createElement("div", {
     role: "log",
     "aria-live": "polite",
     "aria-label": "Conversation",
@@ -1741,186 +2388,413 @@ function BobChat() {
       display: 'flex',
       flexDirection: 'column',
       gap: 10,
-      marginBottom: 14,
+      marginBottom: 12,
       paddingRight: 6
     }
-  }, messages.map((m, i) => /*#__PURE__*/React.createElement("div", {
+  }, chat.messages.map((m, i) => /*#__PURE__*/React.createElement(ChatBubble, {
     key: i,
-    style: {
-      display: 'flex',
-      justifyContent: m.role === 'user' ? 'flex-end' : 'flex-start'
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "chat-bubble",
-    style: {
-      maxWidth: '72%',
-      padding: '12px 16px',
-      borderRadius: m.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-      background: m.role === 'user' ? 'var(--blue2)' : 'var(--card)',
-      border: m.error ? '1px solid rgba(251,90,117,.5)' : '1px solid var(--border)'
-    }
-  }, /*#__PURE__*/React.createElement("p", {
-    className: "sr-only"
-  }, m.role === 'user' ? 'You said' : 'Assistant said'), /*#__PURE__*/React.createElement("pre", {
-    style: {
-      fontSize: 13,
-      whiteSpace: 'pre-wrap',
-      wordBreak: 'break-word',
-      fontFamily: 'inherit',
-      margin: 0,
-      lineHeight: 1.55,
-      color: m.error ? 'var(--red)' : 'inherit'
-    }
-  }, m.content)))), busy && /*#__PURE__*/React.createElement("div", {
+    message: m,
+    compact: compact
+  })), chat.busy && !chat.messages[chat.messages.length - 1]?.content && /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 8,
       alignItems: 'center',
-      padding: '10px 4px'
+      padding: '6px 4px'
     }
   }, /*#__PURE__*/React.createElement("div", {
     className: "spinner",
     style: {
-      width: 18,
-      height: 18,
+      width: 16,
+      height: 16,
       borderWidth: 2
     }
   }), /*#__PURE__*/React.createElement("span", {
-    className: "muted"
+    className: "muted",
+    style: {
+      fontSize: 12
+    }
   }, "Analysing the corpus\u2026")), /*#__PURE__*/React.createElement("div", {
     ref: endRef
-  })), /*#__PURE__*/React.createElement("div", {
+  }));
+}
+function BobChat({
+  chat
+}) {
+  const inputRef = useRef(null);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "fade-in",
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      height: 'calc(100vh - 240px)',
+      minHeight: 420
+    }
+  }, /*#__PURE__*/React.createElement(ChatTranscript, {
+    chat: chat
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       flexWrap: 'wrap',
       gap: 6,
-      marginBottom: 10
+      marginBottom: 10,
+      alignItems: 'center'
     }
-  }, suggestions.map((s, i) => /*#__PURE__*/React.createElement("button", {
+  }, CHAT_SUGGESTIONS.map((s, i) => /*#__PURE__*/React.createElement("button", {
     key: i,
-    onClick: () => send(s),
-    disabled: busy,
+    onClick: () => chat.send(s),
+    disabled: chat.busy,
     className: "btn btn-ghost",
     style: {
       fontSize: 12,
       padding: '6px 12px',
       borderRadius: 20
     }
-  }, s))), /*#__PURE__*/React.createElement("form", {
+  }, s)), chat.messages.length > 1 && /*#__PURE__*/React.createElement("button", {
+    onClick: chat.reset,
+    className: "btn btn-ghost",
+    style: {
+      fontSize: 12,
+      padding: '6px 12px',
+      borderRadius: 20,
+      marginLeft: 'auto'
+    }
+  }, "Clear")), /*#__PURE__*/React.createElement(ChatComposer, {
+    chat: chat,
+    inputRef: inputRef
+  }));
+}
+
+/** Floating assistant, reachable from every tab without losing the thread. */
+function ChatDock({
+  chat,
+  hidden
+}) {
+  const [open, setOpen] = useState(false);
+  const [unread, setUnread] = useState(false);
+  const inputRef = useRef(null);
+  const panelRef = useRef(null);
+  const lastSeen = useRef(chat.messages.length);
+
+  // Badge the launcher when a reply lands while the panel is closed.
+  useEffect(() => {
+    if (open) {
+      lastSeen.current = chat.messages.length;
+      setUnread(false);
+    } else if (chat.messages.length > lastSeen.current) setUnread(true);
+  }, [chat.messages, open]);
+  useEffect(() => {
+    if (!open) return;
+    inputRef.current?.focus();
+    const onKey = e => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
+  if (hidden) return null;
+  return /*#__PURE__*/React.createElement(React.Fragment, null, open && /*#__PURE__*/React.createElement("section", {
+    ref: panelRef,
+    className: "chat-dock glass fade-in",
+    role: "dialog",
+    "aria-label": "FIR Intelligence assistant",
+    "aria-modal": "false"
+  }, /*#__PURE__*/React.createElement("header", {
     style: {
       display: 'flex',
-      gap: 10
-    },
-    onSubmit: e => {
-      e.preventDefault();
-      send();
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 8,
+      padding: '12px 14px',
+      borderBottom: '1px solid var(--border)'
     }
-  }, /*#__PURE__*/React.createElement("label", {
-    className: "sr-only",
-    htmlFor: "chat-input"
-  }, "Ask about the FIR corpus"), /*#__PURE__*/React.createElement("input", {
-    id: "chat-input",
-    ref: inputRef,
-    type: "text",
-    value: input,
-    disabled: busy,
-    onChange: e => setInput(e.target.value),
+  }, /*#__PURE__*/React.createElement("div", {
     style: {
-      flex: 1
-    },
-    placeholder: "Ask about offenders, networks, districts or an FIR number\u2026"
-  }), /*#__PURE__*/React.createElement("button", {
-    type: "submit",
-    className: "btn btn-primary",
-    disabled: busy || !input.trim(),
-    style: {
-      paddingLeft: 24,
-      paddingRight: 24
+      minWidth: 0
     }
-  }, "Send")));
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontSize: 14,
+      fontWeight: 700
+    }
+  }, "Intelligence Assistant"), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, "Grounded in the analysed corpus")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 4,
+      flexShrink: 0
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: chat.reset,
+    title: "Clear conversation",
+    style: {
+      padding: '4px 10px',
+      fontSize: 12
+    }
+  }, "Clear"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: () => setOpen(false),
+    "aria-label": "Close assistant",
+    style: {
+      padding: '4px 11px',
+      fontSize: 15,
+      lineHeight: 1
+    }
+  }, "\xD7"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      display: 'flex',
+      flexDirection: 'column',
+      padding: '12px 14px',
+      minHeight: 0
+    }
+  }, /*#__PURE__*/React.createElement(ChatTranscript, {
+    chat: chat,
+    compact: true
+  }), chat.messages.length <= 1 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: 5,
+      marginBottom: 10
+    }
+  }, CHAT_SUGGESTIONS.slice(0, 3).map((s, i) => /*#__PURE__*/React.createElement("button", {
+    key: i,
+    onClick: () => chat.send(s),
+    disabled: chat.busy,
+    className: "btn btn-ghost",
+    style: {
+      fontSize: 11,
+      padding: '5px 10px',
+      borderRadius: 20
+    }
+  }, s))), /*#__PURE__*/React.createElement(ChatComposer, {
+    chat: chat,
+    inputRef: inputRef,
+    compact: true
+  }))), /*#__PURE__*/React.createElement("button", {
+    className: "chat-fab",
+    onClick: () => setOpen(v => !v),
+    "aria-expanded": open,
+    "aria-haspopup": "dialog",
+    "aria-label": open ? 'Close intelligence assistant' : 'Open intelligence assistant'
+  }, /*#__PURE__*/React.createElement("span", {
+    "aria-hidden": "true",
+    style: {
+      fontSize: 22,
+      lineHeight: 1
+    }
+  }, open ? '×' : '🤖'), unread && !open && /*#__PURE__*/React.createElement("span", {
+    className: "fab-dot",
+    "aria-hidden": "true"
+  }), unread && !open && /*#__PURE__*/React.createElement("span", {
+    className: "sr-only"
+  }, "New reply available")));
 }
 
 // ── Report ─────────────────────────────────────────────────────────────────
+const REPORT_FOCUS = [{
+  value: '',
+  label: 'Full briefing'
+}, {
+  value: 'repeat offenders and their cross-district movement',
+  label: 'Repeat offenders'
+}, {
+  value: 'organised crime networks and their structure',
+  label: 'Organised networks'
+}, {
+  value: 'district and station resourcing priorities',
+  label: 'Resourcing'
+}, {
+  value: 'the most severe and time-critical cases',
+  label: 'Severity triage'
+}, {
+  value: 'cyber and financial crime',
+  label: 'Cyber & fraud'
+}, {
+  value: 'narcotics and the supply chain',
+  label: 'Narcotics'
+}];
+
+/**
+ * The report is generated live on every run rather than served from a cache:
+ * the corpus changes as FIRs are ingested, so a stored report is stale the
+ * moment someone uploads a batch. Text streams in as the model writes it.
+ */
 function ReportView() {
-  const state = useApi('/report');
-  const download = useCallback(report => {
-    const blob = new Blob([report], {
+  const [focus, setFocus] = useState('');
+  const [report, setReport] = useState('');
+  const [meta, setMeta] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [fallback, setFallback] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [finishedAt, setFinishedAt] = useState(null);
+  const abortRef = useRef(null);
+  const generate = useCallback(async focusValue => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+    setError(null);
+    setFallback(null);
+    setReport('');
+    setFinishedAt(null);
+    try {
+      await streamSSE(`/report/stream?focus=${encodeURIComponent(focusValue || '')}`, {
+        signal: controller.signal,
+        onEvent: (event, data) => {
+          if (event === 'start') {
+            setStatus(data);
+            setMeta(data.metadata || null);
+          } else if (event === 'delta') setReport(prev => prev + data.text);else if (event === 'fallback') setFallback(data.reason);
+        }
+      });
+      setFinishedAt(new Date());
+    } catch (err) {
+      if (err.name !== 'AbortError') setError(err.message);
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      setBusy(false);
+    }
+  }, []);
+  useEffect(() => {
+    generate('');
+    return () => abortRef.current?.abort();
+  }, [generate]);
+  const download = useCallback(ext => {
+    const header = `FIR INTELLIGENCE REPORT\nGenerated: ${new Date().toISOString()}\n` + `Source: ${status?.source || 'analysis'}${status?.model ? ` (${status.model})` : ''}\n` + `${focus ? `Focus: ${focus}\n` : ''}\n`;
+    const blob = new Blob([header + report], {
       type: 'text/plain;charset=utf-8'
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `FIR-Intelligence-Report-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.download = `FIR-Intelligence-Report-${new Date().toISOString().slice(0, 10)}.${ext}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // The previous build never released the object URL, leaking the whole
-    // report into memory on every download.
+    // Release the object URL — not doing so leaks the whole report per download.
     URL.revokeObjectURL(url);
-  }, []);
-  return /*#__PURE__*/React.createElement(Async, {
-    state: state
-  }, data => {
-    const meta = data.metadata || {};
-    return /*#__PURE__*/React.createElement("div", {
-      className: "stack fade-in"
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "toolbar",
-      style: {
-        justifyContent: 'space-between'
-      }
-    }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
-      style: {
-        fontSize: 19,
-        fontWeight: 700
-      }
-    }, "Intelligence Report"), /*#__PURE__*/React.createElement("p", {
-      className: "muted"
-    }, "Source: ", data.source, " \xB7 generated ", new Date(data.generated_at).toLocaleString())), /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: 'flex',
-        gap: 8
-      },
-      className: "no-print"
-    }, /*#__PURE__*/React.createElement("button", {
-      className: "btn btn-ghost",
-      onClick: () => window.print()
-    }, "Print"), /*#__PURE__*/React.createElement("button", {
-      className: "btn btn-primary",
-      onClick: () => download(data.report)
-    }, "Download .txt"))), /*#__PURE__*/React.createElement("div", {
-      className: "metric-grid"
-    }, [['FIRs Analysed', meta.total_firs, 'var(--blue)'], ['Repeat Offenders', meta.repeat_offender_count, 'var(--red)'], ['Districts', (meta.districts || []).length, 'var(--green)'], ['Networks', (meta.patterns || []).length, 'var(--amber)']].map(([k, v, c]) => /*#__PURE__*/React.createElement("div", {
-      key: k,
-      className: "glass",
-      style: {
-        padding: 12,
-        textAlign: 'center'
-      }
-    }, /*#__PURE__*/React.createElement("p", {
-      className: "muted",
-      style: {
-        fontSize: 11
-      }
-    }, k), /*#__PURE__*/React.createElement("p", {
-      style: {
-        fontWeight: 700,
-        fontSize: 20,
-        color: c
-      }
-    }, v)))), /*#__PURE__*/React.createElement("div", {
-      className: "glass p-5"
-    }, /*#__PURE__*/React.createElement("pre", {
-      style: {
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-word',
-        fontSize: 13,
-        lineHeight: 1.7,
-        fontFamily: 'inherit',
-        color: 'var(--text2)'
-      }
-    }, data.report)));
-  });
+  }, [report, status, focus]);
+  return /*#__PURE__*/React.createElement("div", {
+    className: "stack fade-in"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "toolbar",
+    style: {
+      justifyContent: 'space-between'
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontSize: 19,
+      fontWeight: 700
+    }
+  }, "Intelligence Report"), /*#__PURE__*/React.createElement("p", {
+    className: "muted"
+  }, busy ? 'Generating live from the current corpus…' : status ? /*#__PURE__*/React.createElement(React.Fragment, null, "Source: ", status.source, status.model ? ` · ${status.model}` : '', finishedAt ? ` · generated ${finishedAt.toLocaleTimeString()}` : '') : 'Preparing…')), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      gap: 8,
+      flexWrap: 'wrap'
+    },
+    className: "no-print"
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
+    className: "sr-only",
+    htmlFor: "report-focus"
+  }, "Report focus"), /*#__PURE__*/React.createElement("select", {
+    id: "report-focus",
+    value: focus,
+    disabled: busy,
+    onChange: e => {
+      setFocus(e.target.value);
+      generate(e.target.value);
+    }
+  }, REPORT_FOCUS.map(f => /*#__PURE__*/React.createElement("option", {
+    key: f.label,
+    value: f.value
+  }, f.label)))), busy ? /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: () => abortRef.current?.abort()
+  }, "Stop") : /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: () => generate(focus)
+  }, "Regenerate"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: () => window.print(),
+    disabled: !report
+  }, "Print"), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-primary",
+    onClick: () => download('txt'),
+    disabled: !report || busy
+  }, "Download"))), meta && /*#__PURE__*/React.createElement("div", {
+    className: "metric-grid"
+  }, [['FIRs Analysed', meta.total_firs, 'var(--blue)'], ['Repeat Offenders', meta.repeat_offender_count, 'var(--red)'], ['Districts', (meta.districts || []).length, 'var(--green)'], ['Networks', (meta.patterns || []).length, 'var(--amber)'], ['Stations', meta.stations_analysed, 'var(--cyan)']].map(([k, v, c]) => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    className: "glass",
+    style: {
+      padding: 12,
+      textAlign: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, k), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontWeight: 700,
+      fontSize: 20,
+      color: c
+    }
+  }, v)))), fallback && /*#__PURE__*/React.createElement("div", {
+    className: "glass p-5",
+    role: "status",
+    style: {
+      borderColor: 'rgba(247,165,59,.45)'
+    }
+  }, /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontSize: 13,
+      color: 'var(--amber)',
+      fontWeight: 600
+    }
+  }, "Model unavailable \u2014 showing the report computed directly from the analysis."), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 12,
+      marginTop: 4
+    }
+  }, fallback)), error && /*#__PURE__*/React.createElement(ErrorState, {
+    error: error,
+    onRetry: () => generate(focus)
+  }), !report && busy && /*#__PURE__*/React.createElement(Spinner, {
+    label: "Analysing the corpus"
+  }), report && /*#__PURE__*/React.createElement("div", {
+    className: "glass p-5"
+  }, /*#__PURE__*/React.createElement("pre", {
+    "aria-live": "polite",
+    style: {
+      whiteSpace: 'pre-wrap',
+      wordBreak: 'break-word',
+      fontSize: 13,
+      lineHeight: 1.7,
+      fontFamily: 'inherit',
+      color: 'var(--text2)'
+    }
+  }, report, busy && /*#__PURE__*/React.createElement("span", {
+    className: "caret",
+    "aria-hidden": "true"
+  }, "\u258D"))), report && !busy && /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, "Findings are automated correlations and require verification by the investigating officer."));
 }
 
 // ── Upload ─────────────────────────────────────────────────────────────────
@@ -2103,6 +2977,10 @@ function App() {
   const dashboard = useApi('/dashboard');
   const health = useApi('/health');
   const tabRefs = useRef({});
+  // Owned here so the thread is the same whether the officer uses the tab or
+  // the floating dock, and survives switching between them.
+  const chat = useChatEngine();
+  const [focusFIR, setFocusFIR] = useState(null);
   useEffect(() => {
     const onHash = () => {
       const id = window.location.hash.slice(1);
@@ -2115,6 +2993,13 @@ function App() {
     setTab(id);
     window.location.hash = id;
   };
+
+  /** Jump from a drill-down straight to that FIR in the records tab. */
+  const openFIR = useCallback(firNumber => {
+    setFocusFIR(firNumber);
+    setTab('firs');
+    window.location.hash = 'firs';
+  }, []);
 
   // Arrow-key navigation, as expected of an ARIA tablist.
   const onTabKey = e => {
@@ -2258,12 +3143,17 @@ function App() {
     "aria-labelledby": `tab-${tab}`,
     tabIndex: -1
   }, tab === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
-    state: dashboard
-  }), tab === 'firs' && /*#__PURE__*/React.createElement(FIRList, null), tab === 'offenders' && /*#__PURE__*/React.createElement(RepeatOffenders, {
+    state: dashboard,
+    onOpenFIR: openFIR
+  }), tab === 'firs' && /*#__PURE__*/React.createElement(FIRList, {
+    initialQuery: focusFIR
+  }), tab === 'offenders' && /*#__PURE__*/React.createElement(RepeatOffenders, {
     threshold: dashboard.data?.name_match_threshold
   }), tab === 'trends' && /*#__PURE__*/React.createElement(CrimeTrends, {
     state: dashboard
-  }), tab === 'stations' && /*#__PURE__*/React.createElement(StationSummary, null), tab === 'networks' && /*#__PURE__*/React.createElement(NetworkView, null), tab === 'chat' && /*#__PURE__*/React.createElement(BobChat, null), tab === 'report' && /*#__PURE__*/React.createElement(ReportView, null), tab === 'upload' && /*#__PURE__*/React.createElement(UploadPanel, {
+  }), tab === 'stations' && /*#__PURE__*/React.createElement(StationSummary, null), tab === 'networks' && /*#__PURE__*/React.createElement(NetworkView, null), tab === 'chat' && /*#__PURE__*/React.createElement(BobChat, {
+    chat: chat
+  }), tab === 'report' && /*#__PURE__*/React.createElement(ReportView, null), tab === 'upload' && /*#__PURE__*/React.createElement(UploadPanel, {
     onIngested: () => {
       dashboard.reload();
       health.reload();
@@ -2276,6 +3166,9 @@ function App() {
       fontSize: 11,
       color: 'var(--text3)'
     }
-  }, "FIR Intelligence & Crime Pattern Detector \xB7 FastAPI + React + Recharts \xB7 findings are automated correlations and require verification by the investigating officer"));
+  }, "FIR Intelligence & Crime Pattern Detector \xB7 FastAPI + React + Recharts \xB7 findings are automated correlations and require verification by the investigating officer"), /*#__PURE__*/React.createElement(ChatDock, {
+    chat: chat,
+    hidden: tab === 'chat'
+  }));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));

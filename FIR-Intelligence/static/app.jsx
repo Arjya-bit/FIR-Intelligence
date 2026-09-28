@@ -37,6 +37,132 @@ async function apiGet(path, signal) {
   return res.json();
 }
 
+/**
+ * Consume a server-sent-event stream over fetch.
+ *
+ * `EventSource` only issues GET requests and cannot send a JSON body, so the
+ * chat stream (a POST carrying the question and conversation history) has to be
+ * read off the response body and framed by hand.
+ */
+async function streamSSE(path, {method = 'GET', body, signal, onEvent}) {
+  const res = await fetch(API + path, {
+    method,
+    headers: body ? {'Content-Type':'application/json'} : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`Stream failed: HTTP ${res.status}`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for (;;) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, {stream:true});
+
+    // Frames are separated by a blank line; keep the trailing partial frame.
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+    for (const frame of frames) {
+      let event = 'message';
+      let data = '';
+      for (const line of frame.split('\n')) {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+      }
+      if (!data) continue;
+      try { onEvent(event, JSON.parse(data)); }
+      catch (e) { /* keep-alive or partial frame */ }
+    }
+  }
+}
+
+const GREETING = {role:'assistant', greeting:true, content:
+  'I am the FIR Intelligence assistant. I answer from the analysed corpus — ' +
+  'crime patterns, repeat offenders, criminal networks, station caseloads and ' +
+  'individual FIRs.\n\nAsk about a specific FIR number, a named accused, a ' +
+  'district, or pick a suggestion.'};
+
+const CHAT_SUGGESTIONS = [
+  'What are the top crime patterns?',
+  'Who are the repeat offenders?',
+  'Which districts have the highest caseload?',
+  'Show the organised crime networks',
+  'Which FIRs are most severe?',
+  'Summarise station activity',
+];
+
+/**
+ * Streaming chat state. Owned by the app shell so the conversation is shared
+ * between the Ask Bob tab and the floating widget, and survives tab switches.
+ */
+function useChatEngine() {
+  const [messages, setMessages] = useState([GREETING]);
+  const [busy, setBusy] = useState(false);
+  const abortRef = useRef(null);
+  // History is read inside an async callback; a ref avoids re-creating `send`
+  // on every message and reading a stale list.
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+
+  const patchLast = useCallback((patch) => {
+    setMessages((prev) => {
+      const next = prev.slice();
+      const last = next[next.length - 1];
+      next[next.length - 1] = typeof patch === 'function' ? patch(last) : {...last, ...patch};
+      return next;
+    });
+  }, []);
+
+  const send = useCallback(async (text) => {
+    const message = String(text ?? '').trim();
+    if (!message || abortRef.current) return;
+
+    const history = messagesRef.current
+      .filter((m) => !m.greeting && !m.error && m.content)
+      .slice(-8)
+      .map((m) => ({role:m.role, content:m.content}));
+
+    setMessages((prev) => [...prev,
+      {role:'user', content:message},
+      {role:'assistant', content:'', streaming:true}]);
+    setBusy(true);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      await streamSSE('/chat/stream', {
+        method:'POST', body:{message, history}, signal:controller.signal,
+        onEvent: (event, data) => {
+          if (event === 'start') patchLast({source:data.source, model:data.model});
+          else if (event === 'delta') patchLast((m) => ({...m, content:m.content + data.text}));
+          else if (event === 'fallback') patchLast({fallback:data.reason, content:''});
+          else if (event === 'done') patchLast({streaming:false, firs:data.firs_referenced || []});
+        },
+      });
+      patchLast({streaming:false});
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        patchLast((m) => ({...m, streaming:false,
+          content:m.content + (m.content ? '\n\n[stopped]' : '[stopped]')}));
+      } else {
+        patchLast({streaming:false, error:true,
+          content:`Could not reach the intelligence service: ${err.message}`});
+      }
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+    }
+  }, [patchLast]);
+
+  const stop = useCallback(() => abortRef.current?.abort(), []);
+  const reset = useCallback(() => { abortRef.current?.abort(); setMessages([GREETING]); }, []);
+
+  return {messages, busy, send, stop, reset};
+}
+
 function useApi(path, deps = []) {
   const [state, setState] = useState({data:null, error:null, loading:true});
   const [nonce, setNonce] = useState(0);
@@ -118,11 +244,179 @@ function SectionCard({title, subtitle, children, actions}) {
   </section>;
 }
 
+// ── Crime type drill-down ──────────────────────────────────────────────────
+
+/** Small labelled bar list — used for districts, stations, sections, MO. */
+function MiniBars({rows, keyField, max, color = 'var(--blue)'}) {
+  if (!rows?.length) return <p className="muted" style={{fontSize:12}}>Not recorded.</p>;
+  const top = max || rows[0].count || 1;
+  return <div style={{display:'flex',flexDirection:'column',gap:6}}>
+    {rows.map((row, i) =>
+      <div key={i} style={{display:'flex',alignItems:'center',gap:10}}>
+        <span style={{flex:'0 0 46%',fontSize:12,overflow:'hidden',textOverflow:'ellipsis',
+              whiteSpace:'nowrap'}} title={row[keyField]}>{row[keyField]}</span>
+        <div style={{flex:1,background:'var(--bg2)',borderRadius:12,height:16,overflow:'hidden'}}>
+          <div style={{height:'100%',borderRadius:12,background:color,
+               width:`${Math.max((row.count / top) * 100, 8)}%`}}/>
+        </div>
+        <span style={{flex:'0 0 26px',textAlign:'right',fontSize:12,fontWeight:700}}>{row.count}</span>
+      </div>)}
+  </div>;
+}
+
+/**
+ * Everything behind one slice of the crime distribution chart.
+ * Fetched on demand rather than shipped with the dashboard payload, which
+ * would mean sending every breakdown for every crime type on first load.
+ */
+function CrimeDrilldown({crimeType, onClose, onOpenFIR}) {
+  const state = useApi(`/crime-types/${encodeURIComponent(crimeType)}`);
+  const closeRef = useRef(null);
+  useEffect(() => { closeRef.current?.focus(); }, [crimeType]);
+
+  return <section className="glass p-5 fade-in" aria-live="polite"
+      style={{borderColor:'rgba(91,155,255,.4)'}}>
+    <Async state={state}>{(d) => <>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',
+           gap:12,flexWrap:'wrap',marginBottom:14}}>
+        <div>
+          <h2 style={{fontSize:17,fontWeight:700,textTransform:'capitalize'}}>{d.label}</h2>
+          <p className="muted">{d.total} FIRs · {d.share_percent}% of the corpus ·
+            {' '}{d.date_range.start} → {d.date_range.end}</p>
+        </div>
+        <button ref={closeRef} className="btn btn-ghost" onClick={onClose}>Close ×</button>
+      </div>
+
+      <div className="metric-grid" style={{marginBottom:16}}>
+        {[['FIRs', d.total, 'var(--blue)'],
+          ['Avg severity', d.avg_severity, 'var(--amber)'],
+          ['Peak severity', d.max_severity, 'var(--red)'],
+          ['Accused named', d.accused_count, 'var(--purple)'],
+          ['Victims', d.victim_count, 'var(--green)'],
+          ['Districts', d.districts.length, 'var(--cyan)']].map(([k, v, c]) =>
+          <div key={k} style={{padding:10,borderRadius:8,background:'var(--bg2)',textAlign:'center'}}>
+            <p className="muted" style={{fontSize:11}}>{k}</p>
+            <p style={{fontWeight:700,fontSize:19,color:c}}>{v}</p>
+          </div>)}
+      </div>
+
+      <div style={{display:'flex',gap:14,flexWrap:'wrap',marginBottom:16}}>
+        {['critical','high','medium','low'].map((band) =>
+          <span key={band} style={{display:'flex',alignItems:'center',gap:6,fontSize:12,
+                color:'var(--text2)'}}>
+            <span aria-hidden="true" style={{width:10,height:10,borderRadius:3,
+                  background:RISK_COLOR[band]}}/>
+            {band}: {d.severity_distribution[band]}
+          </span>)}
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(260px,1fr))',gap:18}}>
+        <div>
+          <h3 style={{fontSize:13,fontWeight:700,marginBottom:8,color:'var(--cyan)'}}>Districts</h3>
+          <MiniBars rows={d.districts.slice(0, 7)} keyField="name" color="var(--cyan)"/>
+        </div>
+        <div>
+          <h3 style={{fontSize:13,fontWeight:700,marginBottom:8,color:'var(--blue)'}}>Stations</h3>
+          <MiniBars rows={d.stations.slice(0, 7)} keyField="name" color="var(--blue)"/>
+        </div>
+        <div>
+          <h3 style={{fontSize:13,fontWeight:700,marginBottom:8,color:'var(--purple)'}}>
+            Sections invoked</h3>
+          <MiniBars rows={d.ipc_sections.slice(0, 7)} keyField="section" color="var(--purple)"/>
+        </div>
+        <div>
+          <h3 style={{fontSize:13,fontWeight:700,marginBottom:8,color:'var(--amber)'}}>
+            Modus operandi</h3>
+          <MiniBars rows={d.modus_operandi} keyField="method" color="var(--amber)"/>
+          {d.weapons.length > 0 && <>
+            <h3 style={{fontSize:13,fontWeight:700,margin:'12px 0 8px',color:'var(--red)'}}>
+              Weapons</h3>
+            <MiniBars rows={d.weapons} keyField="weapon" color="var(--red)"/>
+          </>}
+        </div>
+      </div>
+
+      {Object.keys(d.monthly_trend).length > 1 &&
+        <div style={{marginTop:18}}>
+          <h3 style={{fontSize:13,fontWeight:700,marginBottom:8}}>Monthly trend</h3>
+          <ResponsiveContainer width="100%" height={150}>
+            <AreaChart data={Object.entries(d.monthly_trend).map(([m, v]) => ({month:m, count:v}))}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1c2748"/>
+              <XAxis dataKey="month" stroke="#9dafd4" tick={{fontSize:10}}/>
+              <YAxis stroke="#9dafd4" tick={{fontSize:10}} width={28} allowDecimals={false}/>
+              <Tooltip {...CHART_TOOLTIP}/>
+              <Area type="monotone" dataKey="count" stroke="#5b9bff"
+                    fill="rgba(91,155,255,.18)" strokeWidth={2} isAnimationActive={false}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>}
+
+      {d.repeat_offenders.length > 0 && <div style={{marginTop:18}}>
+        <h3 style={{fontSize:13,fontWeight:700,marginBottom:8,color:'var(--red)'}}>
+          Repeat offenders in this category</h3>
+        <div style={{display:'flex',flexDirection:'column',gap:6}}>
+          {d.repeat_offenders.map((o, i) =>
+            <div key={i} style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap',
+                 padding:'8px 10px',borderRadius:8,background:'var(--bg2)'}}>
+              <span style={{fontWeight:700,fontSize:13}}>{o.name}</span>
+              {o.aliases?.length > 0 &&
+                <span className="muted" style={{fontSize:11}}>alias {o.aliases.join(', ')}</span>}
+              <span className={`badge badge-${o.risk_level}`}>{o.risk_level}</span>
+              <span className="muted" style={{fontSize:11}}>
+                {o.linked_firs_in_type.length} of {o.total_incidents} FIRs here ·
+                {' '}{o.districts.join(', ')}</span>
+            </div>)}
+        </div>
+      </div>}
+
+      {d.networks.length > 0 && <div style={{marginTop:18}}>
+        <h3 style={{fontSize:13,fontWeight:700,marginBottom:8,color:'var(--green)'}}>
+          Networks involved</h3>
+        <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
+          {d.networks.map((n, i) =>
+            <span key={i} style={{padding:'6px 12px',borderRadius:10,background:'var(--bg2)',
+                  fontSize:12,border:'1px solid var(--border)'}}>
+              <strong>{n.name}</strong>
+              <span className="muted"> · {n.matching_firs.length} of {n.fir_count} FIRs</span>
+            </span>)}
+        </div>
+      </div>}
+
+      <div style={{marginTop:18}}>
+        <h3 style={{fontSize:13,fontWeight:700,marginBottom:8}}>
+          Highest-severity FIRs</h3>
+        <div style={{display:'flex',flexDirection:'column',gap:6}}>
+          {d.top_firs.map((f) =>
+            <button key={f.fir_number} className="row-card" style={{padding:'10px 12px'}}
+                    onClick={() => onOpenFIR(f.fir_number)}>
+              <div style={{display:'flex',justifyContent:'space-between',gap:8,flexWrap:'wrap'}}>
+                <span style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap'}}>
+                  <span style={{fontFamily:'ui-monospace,Menlo,monospace',color:'var(--blue)',
+                        fontWeight:700,fontSize:12}}>{f.fir_number}</span>
+                  <span className={`badge badge-${f.severity}`}>{f.severity}</span>
+                </span>
+                <span className="muted" style={{fontSize:11}}>
+                  {f.date} · {f.district} · {f.police_station}</span>
+              </div>
+              <p className="muted clamp-2" style={{marginTop:5,fontSize:12}}>{f.summary}</p>
+            </button>)}
+        </div>
+        <p className="muted" style={{fontSize:11,marginTop:8}}>
+          Select an FIR to open it in the FIR Records tab.</p>
+      </div>
+    </>}</Async>
+  </section>;
+}
+
 // ── Dashboard ──────────────────────────────────────────────────────────────
-function Dashboard({state}) {
+function Dashboard({state, onOpenFIR}) {
+  const [selectedCrime, setSelectedCrime] = useState(null);
   return <Async state={state}>{(data) => {
+    // Keep the raw key alongside the display label so a click can address the
+    // API without having to reverse the prettified name.
     const crimeData = Object.entries(data.crime_breakdown || {})
-      .map(([name, value]) => ({name: label(name), value})).sort((a,b) => b.value - a.value);
+      .map(([key, value]) => ({name: label(key), key, value}))
+      .sort((a,b) => b.value - a.value);
     const districtData = Object.entries(data.district_breakdown || {})
       .map(([name, value]) => ({name, value})).sort((a,b) => b.value - a.value);
     const trendData = Object.entries(data.monthly_trend || {}).map(([name, value]) => ({name, value}));
@@ -167,18 +461,42 @@ function Dashboard({state}) {
       </SectionCard>
 
       <div className="grid-2">
-        <SectionCard title="Crime Type Distribution">
+        <SectionCard title="Crime Type Distribution"
+                     subtitle="Select a segment to break that offence down">
           <ResponsiveContainer width="100%" height={280}>
             <PieChart margin={{top:8,right:70,bottom:8,left:70}}>
               <Pie data={crimeData} dataKey="value" nameKey="name" cx="50%" cy="50%"
                    outerRadius={88} innerRadius={52} paddingAngle={2} minAngle={2}
                    label={({name,percent}) => percent > .045 ? `${name} ${(percent*100).toFixed(0)}%` : ''}
-                   labelLine={{stroke:'#5b9bff',strokeWidth:1}} isAnimationActive={false}>
-                {crimeData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]}/>)}
+                   labelLine={{stroke:'#5b9bff',strokeWidth:1}} isAnimationActive={false}
+                   onClick={(slice) => setSelectedCrime(
+                     (current) => current === slice.key ? null : slice.key)}
+                   style={{cursor:'pointer',outline:'none'}}>
+                {crimeData.map((entry, i) =>
+                  <Cell key={i} fill={COLORS[i % COLORS.length]}
+                        stroke={selectedCrime === entry.key ? '#edf2ff' : undefined}
+                        strokeWidth={selectedCrime === entry.key ? 2.5 : 0}
+                        fillOpacity={selectedCrime && selectedCrime !== entry.key ? .35 : 1}/>)}
               </Pie>
               <Tooltip {...CHART_TOOLTIP}/>
             </PieChart>
           </ResponsiveContainer>
+          {/* A chart click is mouse-only; the same drill-down has to be
+              reachable from the keyboard. */}
+          <div style={{display:'flex',flexWrap:'wrap',gap:5,marginTop:10}}>
+            {crimeData.map((entry, i) =>
+              <button key={entry.key} className="chip chip-btn"
+                      aria-pressed={selectedCrime === entry.key}
+                      onClick={() => setSelectedCrime(
+                        selectedCrime === entry.key ? null : entry.key)}
+                      style={{borderColor: selectedCrime === entry.key
+                                ? COLORS[i % COLORS.length] : 'var(--border)',
+                              color: COLORS[i % COLORS.length],
+                              background: selectedCrime === entry.key
+                                ? COLORS[i % COLORS.length] + '25' : 'transparent'}}>
+                {entry.name} {entry.value}
+              </button>)}
+          </div>
         </SectionCard>
         <SectionCard title="FIRs by District">
           <ResponsiveContainer width="100%" height={280}>
@@ -195,6 +513,9 @@ function Dashboard({state}) {
           </ResponsiveContainer>
         </SectionCard>
       </div>
+
+      {selectedCrime && <CrimeDrilldown crimeType={selectedCrime}
+        onClose={() => setSelectedCrime(null)} onOpenFIR={onOpenFIR}/>}
 
       <SectionCard title="Monthly Crime Trend">
         <ResponsiveContainer width="100%" height={240}>
@@ -242,16 +563,25 @@ function Dashboard({state}) {
 // ── FIR records ────────────────────────────────────────────────────────────
 const PAGE_SIZE = 20;
 
-function FIRList() {
-  const [search, setSearch] = useState('');
-  const [query, setQuery] = useState('');
+function FIRList({initialQuery}) {
+  const [search, setSearch] = useState(initialQuery || '');
+  const [query, setQuery] = useState(initialQuery || '');
   const [crimeType, setCrimeType] = useState('');
   const [district, setDistrict] = useState('');
   const [severity, setSeverity] = useState('');
   const [offset, setOffset] = useState(0);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(initialQuery || null);
 
   const filters = useApi('/filters');
+
+  // Arriving from a drill-down: search for that FIR and expand it.
+  useEffect(() => {
+    if (!initialQuery) return;
+    setSearch(initialQuery);
+    setQuery(initialQuery);
+    setSelected(initialQuery);
+    setOffset(0);
+  }, [initialQuery]);
 
   // Debounce so a keystroke does not fire a request per character.
   useEffect(() => {
@@ -723,141 +1053,286 @@ function NetworkView() {
   </div>;
 }
 
-// ── Bob chat ───────────────────────────────────────────────────────────────
-const GREETING = {role:'assistant', content:
-  'I am the FIR Intelligence assistant. I answer from the analysed corpus only — ' +
-  'crime patterns, repeat offenders, criminal networks, station caseloads and ' +
-  'individual FIRs.\n\nAsk about a specific FIR number, a named accused, a district, ' +
-  'or pick a suggestion below.'};
+// ── Chat ───────────────────────────────────────────────────────────────────
 
-function BobChat() {
-  const [messages, setMessages] = useState([GREETING]);
-  const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
-  const endRef = useRef(null);
-  const inputRef = useRef(null);
-
-  const suggestions = ['What are the top crime patterns?', 'Who are the repeat offenders?',
-    'Which districts have the highest caseload?', 'Show the organised crime networks',
-    'Which FIRs are most severe?', 'Summarise station activity'];
-
-  useEffect(() => { endRef.current?.scrollIntoView({behavior:'smooth', block:'end'}); },
-            [messages, busy]);
-
-  const send = useCallback(async (text) => {
-    const message = (text ?? input).trim();
-    if (!message || busy) return;
-    setMessages((prev) => [...prev, {role:'user', content:message}]);
-    setInput('');
-    setBusy(true);
-    try {
-      const res = await fetch(API + '/chat', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({message}),
-      });
-      if (!res.ok) throw new Error(`Server returned ${res.status}`);
-      const data = await res.json();
-      setMessages((prev) => [...prev, {
-        role:'assistant',
-        content: data.response || 'No answer returned.',
-        firs: data.firs_referenced || [],
-      }]);
-    } catch (err) {
-      setMessages((prev) => [...prev, {role:'assistant', error:true,
-        content:`Could not reach the intelligence service: ${err.message}`}]);
-    } finally {
-      setBusy(false);
-      inputRef.current?.focus();
-    }
-  }, [input, busy]);
-
-  return <div className="fade-in" style={{display:'flex',flexDirection:'column',
-      height:'calc(100vh - 230px)',minHeight:420}}>
-    <div role="log" aria-live="polite" aria-label="Conversation"
-         style={{flex:1,overflowY:'auto',display:'flex',flexDirection:'column',
-                 gap:10,marginBottom:14,paddingRight:6}}>
-      {messages.map((m, i) =>
-        <div key={i} style={{display:'flex',justifyContent:m.role === 'user' ? 'flex-end' : 'flex-start'}}>
-          <div className="chat-bubble" style={{maxWidth:'72%',padding:'12px 16px',
-              borderRadius: m.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
-              background: m.role === 'user' ? 'var(--blue2)' : 'var(--card)',
-              border: m.error ? '1px solid rgba(251,90,117,.5)' : '1px solid var(--border)'}}>
-            <p className="sr-only">{m.role === 'user' ? 'You said' : 'Assistant said'}</p>
-            <pre style={{fontSize:13,whiteSpace:'pre-wrap',wordBreak:'break-word',
-                 fontFamily:'inherit',margin:0,lineHeight:1.55,
-                 color: m.error ? 'var(--red)' : 'inherit'}}>{m.content}</pre>
-          </div>
-        </div>)}
-      {busy && <div style={{display:'flex',gap:8,alignItems:'center',padding:'10px 4px'}}>
-        <div className="spinner" style={{width:18,height:18,borderWidth:2}}/>
-        <span className="muted">Analysing the corpus…</span>
-      </div>}
-      <div ref={endRef}/>
+/** One message bubble. Shared by the full tab and the floating widget. */
+function ChatBubble({message, compact}) {
+  const isUser = message.role === 'user';
+  return <div style={{display:'flex',justifyContent:isUser ? 'flex-end' : 'flex-start'}}>
+    <div className="chat-bubble" style={{maxWidth: compact ? '90%' : '72%',
+        padding: compact ? '10px 13px' : '12px 16px',
+        borderRadius: isUser ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+        background: isUser ? 'var(--blue2)' : 'var(--card)',
+        border: message.error ? '1px solid rgba(251,90,117,.5)' : '1px solid var(--border)'}}>
+      <p className="sr-only">{isUser ? 'You said' : 'Assistant said'}</p>
+      {message.fallback && <p style={{fontSize:11,color:'var(--amber)',marginBottom:6}}>
+        Model unavailable — showing the computed analysis instead.</p>}
+      <pre style={{fontSize: compact ? 12.5 : 13,whiteSpace:'pre-wrap',wordBreak:'break-word',
+           fontFamily:'inherit',margin:0,lineHeight:1.55,
+           color: message.error ? 'var(--red)' : 'inherit'}}>{message.content}
+        {message.streaming && <span className="caret" aria-hidden="true">▍</span>}</pre>
+      {!isUser && !message.streaming && message.source && !message.greeting &&
+        <p style={{fontSize:10,color:'var(--text3)',marginTop:8}}>
+          {message.source}{message.model ? ` · ${message.model}` : ''}</p>}
     </div>
-
-    <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10}}>
-      {suggestions.map((s, i) =>
-        <button key={i} onClick={() => send(s)} disabled={busy} className="btn btn-ghost"
-                style={{fontSize:12,padding:'6px 12px',borderRadius:20}}>{s}</button>)}
-    </div>
-
-    <form style={{display:'flex',gap:10}} onSubmit={(e) => { e.preventDefault(); send(); }}>
-      <label className="sr-only" htmlFor="chat-input">Ask about the FIR corpus</label>
-      <input id="chat-input" ref={inputRef} type="text" value={input} disabled={busy}
-             onChange={(e) => setInput(e.target.value)} style={{flex:1}}
-             placeholder="Ask about offenders, networks, districts or an FIR number…"/>
-      <button type="submit" className="btn btn-primary" disabled={busy || !input.trim()}
-              style={{paddingLeft:24,paddingRight:24}}>Send</button>
-    </form>
   </div>;
 }
 
+function ChatComposer({chat, inputRef, compact}) {
+  const [input, setInput] = useState('');
+  const submit = (e) => {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || chat.busy) return;
+    setInput('');
+    chat.send(text);
+  };
+  return <form style={{display:'flex',gap:8}} onSubmit={submit}>
+    <label className="sr-only" htmlFor={compact ? 'dock-input' : 'chat-input'}>
+      Ask about the FIR corpus</label>
+    <input id={compact ? 'dock-input' : 'chat-input'} ref={inputRef} type="text"
+           value={input} onChange={(e) => setInput(e.target.value)} style={{flex:1,minWidth:0}}
+           placeholder={compact ? 'Ask about the corpus…'
+                                : 'Ask about offenders, networks, districts or an FIR number…'}/>
+    {chat.busy
+      ? <button type="button" className="btn btn-ghost" onClick={chat.stop}>Stop</button>
+      : <button type="submit" className="btn btn-primary" disabled={!input.trim()}
+                style={{paddingLeft: compact ? 16 : 24, paddingRight: compact ? 16 : 24}}>
+          Send</button>}
+  </form>;
+}
+
+function ChatTranscript({chat, compact}) {
+  const endRef = useRef(null);
+  useEffect(() => { endRef.current?.scrollIntoView({behavior:'smooth', block:'end'}); },
+            [chat.messages, chat.busy]);
+  return <div role="log" aria-live="polite" aria-label="Conversation"
+       style={{flex:1,overflowY:'auto',display:'flex',flexDirection:'column',
+               gap:10,marginBottom:12,paddingRight:6}}>
+    {chat.messages.map((m, i) => <ChatBubble key={i} message={m} compact={compact}/>)}
+    {chat.busy && !chat.messages[chat.messages.length - 1]?.content &&
+      <div style={{display:'flex',gap:8,alignItems:'center',padding:'6px 4px'}}>
+        <div className="spinner" style={{width:16,height:16,borderWidth:2}}/>
+        <span className="muted" style={{fontSize:12}}>Analysing the corpus…</span>
+      </div>}
+    <div ref={endRef}/>
+  </div>;
+}
+
+function BobChat({chat}) {
+  const inputRef = useRef(null);
+  return <div className="fade-in" style={{display:'flex',flexDirection:'column',
+      height:'calc(100vh - 240px)',minHeight:420}}>
+    <ChatTranscript chat={chat}/>
+    <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10,alignItems:'center'}}>
+      {CHAT_SUGGESTIONS.map((s, i) =>
+        <button key={i} onClick={() => chat.send(s)} disabled={chat.busy} className="btn btn-ghost"
+                style={{fontSize:12,padding:'6px 12px',borderRadius:20}}>{s}</button>)}
+      {chat.messages.length > 1 &&
+        <button onClick={chat.reset} className="btn btn-ghost"
+                style={{fontSize:12,padding:'6px 12px',borderRadius:20,marginLeft:'auto'}}>
+          Clear</button>}
+    </div>
+    <ChatComposer chat={chat} inputRef={inputRef}/>
+  </div>;
+}
+
+/** Floating assistant, reachable from every tab without losing the thread. */
+function ChatDock({chat, hidden}) {
+  const [open, setOpen] = useState(false);
+  const [unread, setUnread] = useState(false);
+  const inputRef = useRef(null);
+  const panelRef = useRef(null);
+  const lastSeen = useRef(chat.messages.length);
+
+  // Badge the launcher when a reply lands while the panel is closed.
+  useEffect(() => {
+    if (open) { lastSeen.current = chat.messages.length; setUnread(false); }
+    else if (chat.messages.length > lastSeen.current) setUnread(true);
+  }, [chat.messages, open]);
+
+  useEffect(() => {
+    if (!open) return;
+    inputRef.current?.focus();
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  if (hidden) return null;
+
+  return <>
+    {open && <section ref={panelRef} className="chat-dock glass fade-in" role="dialog"
+        aria-label="FIR Intelligence assistant" aria-modal="false">
+      <header style={{display:'flex',alignItems:'center',justifyContent:'space-between',
+          gap:8,padding:'12px 14px',borderBottom:'1px solid var(--border)'}}>
+        <div style={{minWidth:0}}>
+          <h2 style={{fontSize:14,fontWeight:700}}>Intelligence Assistant</h2>
+          <p className="muted" style={{fontSize:11}}>Grounded in the analysed corpus</p>
+        </div>
+        <div style={{display:'flex',gap:4,flexShrink:0}}>
+          <button className="btn btn-ghost" onClick={chat.reset} title="Clear conversation"
+                  style={{padding:'4px 10px',fontSize:12}}>Clear</button>
+          <button className="btn btn-ghost" onClick={() => setOpen(false)}
+                  aria-label="Close assistant" style={{padding:'4px 11px',fontSize:15,lineHeight:1}}>×</button>
+        </div>
+      </header>
+
+      <div style={{flex:1,display:'flex',flexDirection:'column',padding:'12px 14px',minHeight:0}}>
+        <ChatTranscript chat={chat} compact/>
+        {chat.messages.length <= 1 &&
+          <div style={{display:'flex',flexWrap:'wrap',gap:5,marginBottom:10}}>
+            {CHAT_SUGGESTIONS.slice(0, 3).map((s, i) =>
+              <button key={i} onClick={() => chat.send(s)} disabled={chat.busy}
+                      className="btn btn-ghost"
+                      style={{fontSize:11,padding:'5px 10px',borderRadius:20}}>{s}</button>)}
+          </div>}
+        <ChatComposer chat={chat} inputRef={inputRef} compact/>
+      </div>
+    </section>}
+
+    <button className="chat-fab" onClick={() => setOpen((v) => !v)}
+            aria-expanded={open} aria-haspopup="dialog"
+            aria-label={open ? 'Close intelligence assistant' : 'Open intelligence assistant'}>
+      <span aria-hidden="true" style={{fontSize:22,lineHeight:1}}>{open ? '×' : '🤖'}</span>
+      {unread && !open && <span className="fab-dot" aria-hidden="true"/>}
+      {unread && !open && <span className="sr-only">New reply available</span>}
+    </button>
+  </>;
+}
+
 // ── Report ─────────────────────────────────────────────────────────────────
+const REPORT_FOCUS = [
+  {value:'', label:'Full briefing'},
+  {value:'repeat offenders and their cross-district movement', label:'Repeat offenders'},
+  {value:'organised crime networks and their structure', label:'Organised networks'},
+  {value:'district and station resourcing priorities', label:'Resourcing'},
+  {value:'the most severe and time-critical cases', label:'Severity triage'},
+  {value:'cyber and financial crime', label:'Cyber & fraud'},
+  {value:'narcotics and the supply chain', label:'Narcotics'},
+];
+
+/**
+ * The report is generated live on every run rather than served from a cache:
+ * the corpus changes as FIRs are ingested, so a stored report is stale the
+ * moment someone uploads a batch. Text streams in as the model writes it.
+ */
 function ReportView() {
-  const state = useApi('/report');
-  const download = useCallback((report) => {
-    const blob = new Blob([report], {type:'text/plain;charset=utf-8'});
+  const [focus, setFocus] = useState('');
+  const [report, setReport] = useState('');
+  const [meta, setMeta] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [fallback, setFallback] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [finishedAt, setFinishedAt] = useState(null);
+  const abortRef = useRef(null);
+
+  const generate = useCallback(async (focusValue) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true); setError(null); setFallback(null); setReport(''); setFinishedAt(null);
+    try {
+      await streamSSE(`/report/stream?focus=${encodeURIComponent(focusValue || '')}`, {
+        signal: controller.signal,
+        onEvent: (event, data) => {
+          if (event === 'start') { setStatus(data); setMeta(data.metadata || null); }
+          else if (event === 'delta') setReport((prev) => prev + data.text);
+          else if (event === 'fallback') setFallback(data.reason);
+        },
+      });
+      setFinishedAt(new Date());
+    } catch (err) {
+      if (err.name !== 'AbortError') setError(err.message);
+    } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    generate('');
+    return () => abortRef.current?.abort();
+  }, [generate]);
+
+  const download = useCallback((ext) => {
+    const header = `FIR INTELLIGENCE REPORT\nGenerated: ${new Date().toISOString()}\n` +
+      `Source: ${status?.source || 'analysis'}${status?.model ? ` (${status.model})` : ''}\n` +
+      `${focus ? `Focus: ${focus}\n` : ''}\n`;
+    const blob = new Blob([header + report], {type:'text/plain;charset=utf-8'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `FIR-Intelligence-Report-${new Date().toISOString().slice(0,10)}.txt`;
+    a.download = `FIR-Intelligence-Report-${new Date().toISOString().slice(0,10)}.${ext}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // The previous build never released the object URL, leaking the whole
-    // report into memory on every download.
+    // Release the object URL — not doing so leaks the whole report per download.
     URL.revokeObjectURL(url);
-  }, []);
+  }, [report, status, focus]);
 
-  return <Async state={state}>{(data) => {
-    const meta = data.metadata || {};
-    return <div className="stack fade-in">
-      <div className="toolbar" style={{justifyContent:'space-between'}}>
+  return <div className="stack fade-in">
+    <div className="toolbar" style={{justifyContent:'space-between'}}>
+      <div>
+        <h2 style={{fontSize:19,fontWeight:700}}>Intelligence Report</h2>
+        <p className="muted">
+          {busy ? 'Generating live from the current corpus…'
+                : status ? <>Source: {status.source}{status.model ? ` · ${status.model}` : ''}
+                    {finishedAt ? ` · generated ${finishedAt.toLocaleTimeString()}` : ''}</>
+                : 'Preparing…'}
+        </p>
+      </div>
+      <div style={{display:'flex',gap:8,flexWrap:'wrap'}} className="no-print">
         <div>
-          <h2 style={{fontSize:19,fontWeight:700}}>Intelligence Report</h2>
-          <p className="muted">Source: {data.source} · generated {new Date(data.generated_at).toLocaleString()}</p>
+          <label className="sr-only" htmlFor="report-focus">Report focus</label>
+          <select id="report-focus" value={focus} disabled={busy}
+                  onChange={(e) => { setFocus(e.target.value); generate(e.target.value); }}>
+            {REPORT_FOCUS.map((f) => <option key={f.label} value={f.value}>{f.label}</option>)}
+          </select>
         </div>
-        <div style={{display:'flex',gap:8}} className="no-print">
-          <button className="btn btn-ghost" onClick={() => window.print()}>Print</button>
-          <button className="btn btn-primary" onClick={() => download(data.report)}>Download .txt</button>
-        </div>
+        {busy
+          ? <button className="btn btn-ghost" onClick={() => abortRef.current?.abort()}>Stop</button>
+          : <button className="btn btn-ghost" onClick={() => generate(focus)}>Regenerate</button>}
+        <button className="btn btn-ghost" onClick={() => window.print()} disabled={!report}>Print</button>
+        <button className="btn btn-primary" onClick={() => download('txt')} disabled={!report || busy}>
+          Download</button>
       </div>
-      <div className="metric-grid">
-        {[['FIRs Analysed', meta.total_firs, 'var(--blue)'],
-          ['Repeat Offenders', meta.repeat_offender_count, 'var(--red)'],
-          ['Districts', (meta.districts || []).length, 'var(--green)'],
-          ['Networks', (meta.patterns || []).length, 'var(--amber)']].map(([k, v, c]) =>
-          <div key={k} className="glass" style={{padding:12,textAlign:'center'}}>
-            <p className="muted" style={{fontSize:11}}>{k}</p>
-            <p style={{fontWeight:700,fontSize:20,color:c}}>{v}</p>
-          </div>)}
-      </div>
-      <div className="glass p-5">
-        <pre style={{whiteSpace:'pre-wrap',wordBreak:'break-word',fontSize:13,lineHeight:1.7,
-             fontFamily:'inherit',color:'var(--text2)'}}>{data.report}</pre>
-      </div>
-    </div>;
-  }}</Async>;
+    </div>
+
+    {meta && <div className="metric-grid">
+      {[['FIRs Analysed', meta.total_firs, 'var(--blue)'],
+        ['Repeat Offenders', meta.repeat_offender_count, 'var(--red)'],
+        ['Districts', (meta.districts || []).length, 'var(--green)'],
+        ['Networks', (meta.patterns || []).length, 'var(--amber)'],
+        ['Stations', meta.stations_analysed, 'var(--cyan)']].map(([k, v, c]) =>
+        <div key={k} className="glass" style={{padding:12,textAlign:'center'}}>
+          <p className="muted" style={{fontSize:11}}>{k}</p>
+          <p style={{fontWeight:700,fontSize:20,color:c}}>{v}</p>
+        </div>)}
+    </div>}
+
+    {fallback && <div className="glass p-5" role="status"
+        style={{borderColor:'rgba(247,165,59,.45)'}}>
+      <p style={{fontSize:13,color:'var(--amber)',fontWeight:600}}>
+        Model unavailable — showing the report computed directly from the analysis.</p>
+      <p className="muted" style={{fontSize:12,marginTop:4}}>{fallback}</p>
+    </div>}
+
+    {error && <ErrorState error={error} onRetry={() => generate(focus)}/>}
+
+    {!report && busy && <Spinner label="Analysing the corpus"/>}
+
+    {report && <div className="glass p-5">
+      <pre aria-live="polite" style={{whiteSpace:'pre-wrap',wordBreak:'break-word',fontSize:13,
+           lineHeight:1.7,fontFamily:'inherit',color:'var(--text2)'}}>{report}
+        {busy && <span className="caret" aria-hidden="true">▍</span>}</pre>
+    </div>}
+
+    {report && !busy && <p className="muted" style={{fontSize:11}}>
+      Findings are automated correlations and require verification by the investigating officer.
+    </p>}
+  </div>;
 }
 
 // ── Upload ─────────────────────────────────────────────────────────────────
@@ -965,6 +1440,10 @@ function App() {
   const dashboard = useApi('/dashboard');
   const health = useApi('/health');
   const tabRefs = useRef({});
+  // Owned here so the thread is the same whether the officer uses the tab or
+  // the floating dock, and survives switching between them.
+  const chat = useChatEngine();
+  const [focusFIR, setFocusFIR] = useState(null);
 
   useEffect(() => {
     const onHash = () => {
@@ -976,6 +1455,13 @@ function App() {
   }, []);
 
   const select = (id) => { setTab(id); window.location.hash = id; };
+
+  /** Jump from a drill-down straight to that FIR in the records tab. */
+  const openFIR = useCallback((firNumber) => {
+    setFocusFIR(firNumber);
+    setTab('firs');
+    window.location.hash = 'firs';
+  }, []);
 
   // Arrow-key navigation, as expected of an ARIA tablist.
   const onTabKey = (e) => {
@@ -1036,13 +1522,13 @@ function App() {
 
     <main id="main" className="shell" style={{padding:'0 20px 40px',flex:1}}>
       <div role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`} tabIndex={-1}>
-      {tab === 'dashboard' && <Dashboard state={dashboard}/>}
-      {tab === 'firs' && <FIRList/>}
+      {tab === 'dashboard' && <Dashboard state={dashboard} onOpenFIR={openFIR}/>}
+      {tab === 'firs' && <FIRList initialQuery={focusFIR}/>}
       {tab === 'offenders' && <RepeatOffenders threshold={dashboard.data?.name_match_threshold}/>}
       {tab === 'trends' && <CrimeTrends state={dashboard}/>}
       {tab === 'stations' && <StationSummary/>}
       {tab === 'networks' && <NetworkView/>}
-      {tab === 'chat' && <BobChat/>}
+      {tab === 'chat' && <BobChat chat={chat}/>}
       {tab === 'report' && <ReportView/>}
       {tab === 'upload' && <UploadPanel onIngested={() => { dashboard.reload(); health.reload(); }}/>}
       </div>
@@ -1053,6 +1539,9 @@ function App() {
       FIR Intelligence &amp; Crime Pattern Detector · FastAPI + React + Recharts ·
       findings are automated correlations and require verification by the investigating officer
     </footer>
+
+    {/* Hidden on the chat tab, where the full conversation is already on screen. */}
+    <ChatDock chat={chat} hidden={tab === 'chat'}/>
   </div>;
 }
 

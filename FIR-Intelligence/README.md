@@ -34,9 +34,62 @@ python main.py
 Open <http://localhost:8000>. The service seeds an NCRB-shaped corpus of 100 FIRs, runs the
 analysis pipeline, and serves the dashboard. Interactive API docs are at `/docs`.
 
-Optional configuration lives in `.env` (`cp .env.example .env`) — watsonx.ai credentials,
-MongoDB, seed size, matching thresholds. **Everything is optional**: with nothing set the
-service runs on an in-memory store and answers from the rule-based engine.
+Optional configuration lives in `.env` (`cp .env.example .env`). **Everything is
+optional**: with nothing set, the service runs on an in-memory store and answers from the
+deterministic engine.
+
+### Enabling the AI assistant
+
+The assistant and the intelligence report use **Z.ai (GLM)**:
+
+```bash
+cp .env.example .env
+# then set:
+ZAI_API_KEY=your-key-from-https://z.ai
+LLM_MODEL=glm-4.6
+```
+
+Restart, and `/api/health` reports `"ai_enabled": true`. Answers then stream token by
+token. The endpoint is OpenAI-compatible, so `LLM_BASE_URL` can point at any compatible
+service (mainland China: `https://open.bigmodel.cn/api/paas/v4`).
+
+Without a key nothing breaks: the assistant answers from the analysed corpus instead, and
+says so. Replies are never canned — see *Grounding* below.
+
+## The assistant
+
+- **Floating widget** on every tab (bottom-right), plus a full **Ask Bob** tab. One
+  conversation, shared between them, preserved across tab switches.
+- **Streams** replies token by token over SSE, with a stop control.
+- **Multi-turn** — follow-ups like "and in Agra?" resolve against the previous turn.
+- **Attributed** — each reply states which engine produced it, so a computed fallback is
+  never passed off as a model answer.
+
+### Grounding
+
+Every question is answered from the corpus twice over. The detection pipeline computes the
+answer first; that computed answer, plus a digest of corpus facts, is handed to the model as
+authoritative context, and the system prompt forbids inventing an FIR number, name, district
+or figure. If the model is unreachable the computed answer is returned directly, labelled.
+
+This matters for a policing tool: a hallucinated offender is worse than "not in the data".
+
+## The intelligence report
+
+Regenerated live on every request — the corpus changes as FIRs are ingested, so a cached
+report is stale the moment someone uploads a batch. Text streams in as the model writes it.
+
+Focus the briefing (repeat offenders, organised networks, resourcing, severity triage,
+cyber & fraud, narcotics) and the analysis and recommendations re-weight accordingly. The
+computed analysis is always returned alongside the prose, so you can see what the narrative
+was derived from.
+
+## Drill-down
+
+Selecting a segment of the crime distribution chart (or its keyboard-accessible chip below)
+opens a breakdown of that offence: severity spread, districts, stations, sections invoked,
+modus operandi, weapons, monthly trend, the repeat offenders and networks involved, and the
+highest-severity FIRs. Selecting an FIR opens it in the FIR Records tab.
 
 ## What it does
 
@@ -102,8 +155,11 @@ tests/               pytest suite
 | `GET /api/stations` | Station rollups with risk assessments |
 | `GET /api/networks` | Detected organised networks |
 | `GET /api/trends` | Month-by-crime-type series |
-| `GET /api/report` | Intelligence report + metadata |
+| `GET /api/report` | Intelligence report + metadata — `focus` optional |
+| `GET /api/report/stream` | The same, streamed live over SSE |
+| `GET /api/crime-types/{type}` | Full breakdown of one crime type (chart drill-down) |
 | `POST /api/chat` | Ask a question about the corpus |
+| `POST /api/chat/stream` | The same, streamed token by token over SSE |
 | `POST /api/upload-firs` | Ingest a JSON array of FIRs and re-analyse |
 
 `GET /api/firs` returns `{items, total, limit, offset, has_more}`.
@@ -112,7 +168,11 @@ tests/               pytest suite
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `WATSONX_API_KEY` / `WATSONX_PROJECT_ID` | unset | Enables watsonx.ai; without them the rule-based engine is used |
+| `ZAI_API_KEY` | unset | Enables the Z.ai assistant and AI report generation |
+| `LLM_BASE_URL` | `https://api.z.ai/api/paas/v4` | Any OpenAI-compatible endpoint |
+| `LLM_MODEL` | `glm-4.6` | Model id |
+| `LLM_THINKING` | `false` | GLM-4.5+ reasoning mode (slower) |
+| `WATSONX_API_KEY` / `WATSONX_PROJECT_ID` | unset | Secondary provider; also used for crime classification |
 | `FIR_STORAGE` | `auto` | `auto` \| `memory` \| `mongodb` (fail if unreachable) |
 | `MONGO_URL` | `mongodb://localhost:27017` | Used when Mongo is reachable |
 | `FIR_SEED_SIZE` | `100` | FIRs generated on first boot |
@@ -129,8 +189,20 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-110 tests cover identity resolution, entity extraction, the storage backend, the
-deterministic answerer, and every HTTP endpoint including error paths.
+146 tests cover identity resolution, entity extraction, the storage backend, the
+deterministic answerer, the LLM client (request shape, streaming, every failure mode,
+prompt grounding), the SSE endpoints, the crime drill-down, and every HTTP endpoint
+including error paths.
+
+To exercise the LLM paths without a key or outbound network access, a development stub of
+an OpenAI-compatible endpoint is included:
+
+```bash
+python scripts/mock_llm_server.py &
+LLM_BASE_URL=http://127.0.0.1:8899/v1 ZAI_API_KEY=dev-key python main.py
+```
+
+`MOCK_LLM_FAIL=500` makes it fail, so the fallback path can be checked too.
 
 ## IBM Bob CLI (MCP)
 
@@ -161,7 +233,8 @@ police network. After editing `static/app.jsx`:
 
 | Component | Technology |
 |-----------|-----------|
-| AI/NLP | IBM watsonx.ai (Granite 3 8B Instruct), rule-based fallback |
+| Assistant & reports | Z.ai GLM (OpenAI-compatible, streamed), watsonx.ai secondary, deterministic fallback |
+| Crime classification | IBM watsonx.ai (Granite 3 8B Instruct), keyword fallback |
 | Agent interface | IBM Bob CLI via MCP |
 | Backend | Python 3.11+, FastAPI, Pydantic, RapidFuzz |
 | Storage | MongoDB (Motor) — optional, in-memory fallback |
@@ -178,3 +251,6 @@ police network. After editing `static/app.jsx`:
 - The seeded corpus is generated, not real FIR data.
 - No authentication — the API is open. Do not expose it beyond localhost without putting an
   authenticating proxy in front of it.
+- Model answers are constrained by grounding and a strict system prompt, but no LLM is
+  guaranteed faithful. Every finding is labelled as an automated correlation requiring
+  verification, and the computed analysis is always available beside the prose.

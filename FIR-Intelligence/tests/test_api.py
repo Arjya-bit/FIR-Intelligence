@@ -27,7 +27,10 @@ class TestMeta:
         assert body["firs_analyzed"] > 0
 
     def test_health_reports_no_credentials_honestly(self, client):
-        assert client.get("/api/health").json()["language_model"] == "rule-based"
+        body = client.get("/api/health").json()
+        assert body["language_model"] == "rule-based analysis"
+        assert body["ai_enabled"] is False
+        assert body["llm"]["configured"] is False
 
     def test_filters_drive_the_ui_dropdowns(self, client):
         body = client.get("/api/filters").json()
@@ -178,6 +181,19 @@ class TestChatAndReport:
         assert body["metadata"]["total_firs"] == total
         assert f"{total} FIRs" in body["report"]
         assert body["source"] == "rule-based analysis"
+        # The computed analysis is always returned alongside the prose, so the
+        # UI can show what the narrative was derived from.
+        assert body["analysis"]
+
+    def test_report_is_regenerated_not_cached(self, client):
+        """The corpus changes as FIRs are ingested; a cached report goes stale."""
+        first = client.get("/api/report").json()["generated_at"]
+        second = client.get("/api/report").json()["generated_at"]
+        assert first != second
+
+    def test_report_accepts_a_focus(self, client):
+        body = client.get("/api/report", params={"focus": "narcotics"}).json()
+        assert body["focus"] == "narcotics"
 
 
 class TestUpload:
