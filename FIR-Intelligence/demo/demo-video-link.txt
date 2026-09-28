@@ -1,0 +1,4 @@
+# Replace this with your actual demo video URL before submission
+# Record a 3-5 minute video showing the app running
+# Upload to YouTube (unlisted) or Loom
+PLACEHOLDER_REPLACE_BEFORE_SUBMISSION
