@@ -79,10 +79,11 @@ def _compose(messages: list[dict]) -> str:
     )
 
 
-@app.post("/v1/chat/completions")
+# Match any prefix so the stub stands in for every Z.ai-style base path
+# (/v1, /api/paas/v4, /api/coding/paas/v4) without enumerating them.
+@app.post("/{prefix:path}/chat/completions")
 @app.post("/chat/completions")
-@app.post("/api/paas/v4/chat/completions")
-async def chat_completions(request: Request):
+async def chat_completions(request: Request, prefix: str = ""):
     body = await request.json()
     messages = body.get("messages") or []
     model = body.get("model", "mock-model")

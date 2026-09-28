@@ -46,6 +46,19 @@ def sse(frames: list[str]) -> bytes:
     return "".join(f"data: {f}\n\n" for f in frames).encode()
 
 
+class TestSuiteIsolation:
+    """A developer's real .env must not change how the suite behaves."""
+
+    def test_provider_credentials_are_blanked(self):
+        assert os.environ.get("ZAI_API_KEY") == ""
+        assert os.environ.get("WATSONX_API_KEY") == ""
+
+    def test_app_defaults_to_the_fallback_engine(self, client):
+        # Without this, a machine holding a real key would take the live path
+        # and make billable calls during `pytest`.
+        assert client.get("/api/health").json()["ai_enabled"] is False
+
+
 class TestConfiguration:
     def test_not_configured_without_a_key(self, monkeypatch):
         monkeypatch.setattr(llm_client, "API_KEY", "")

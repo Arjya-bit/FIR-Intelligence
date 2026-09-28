@@ -7,10 +7,13 @@ vLLM, Groq, …) works without code changes, and a wrong guess about a model nam
 is a config fix rather than a rewrite.
 
     ZAI_API_KEY=...                       # or LLM_API_KEY
-    LLM_BASE_URL=https://api.z.ai/api/paas/v4
-    LLM_MODEL=glm-4.6
+    LLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
+    LLM_MODEL=glm-5.2
 
-Mainland-China accounts use ``https://open.bigmodel.cn/api/paas/v4``.
+Z.ai serves coding-plan keys from ``/api/coding/paas/v4`` and general keys from
+``/api/paas/v4``; mainland-China accounts use
+``https://open.bigmodel.cn/api/paas/v4``. All three speak the same protocol, so
+only ``LLM_BASE_URL`` changes.
 
 Both a buffered and a streaming call are provided. Answers are always grounded:
 the caller supplies facts computed from the analysed corpus, and the system
@@ -31,8 +34,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.getenv("ZAI_API_KEY") or os.getenv("LLM_API_KEY", "")
-BASE_URL = os.getenv("LLM_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip("/")
-MODEL = os.getenv("LLM_MODEL", "glm-4.6")
+BASE_URL = os.getenv("LLM_BASE_URL", "https://api.z.ai/api/coding/paas/v4").rstrip("/")
+MODEL = os.getenv("LLM_MODEL", "glm-5.2")
 PROVIDER_LABEL = os.getenv("LLM_PROVIDER_LABEL", "Z.ai GLM")
 TIMEOUT = float(os.getenv("LLM_TIMEOUT", "90"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))

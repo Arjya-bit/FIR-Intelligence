@@ -46,12 +46,23 @@ The assistant and the intelligence report use **Z.ai (GLM)**:
 cp .env.example .env
 # then set:
 ZAI_API_KEY=your-key-from-https://z.ai
-LLM_MODEL=glm-4.6
+LLM_BASE_URL=https://api.z.ai/api/coding/paas/v4   # coding-plan keys
+LLM_MODEL=glm-5.2
 ```
 
-Restart, and `/api/health` reports `"ai_enabled": true`. Answers then stream token by
-token. The endpoint is OpenAI-compatible, so `LLM_BASE_URL` can point at any compatible
-service (mainland China: `https://open.bigmodel.cn/api/paas/v4`).
+Check it before starting the app:
+
+```bash
+python scripts/check_llm.py
+```
+
+It makes one buffered and one streaming call and names the fix for whatever comes back.
+Then restart and `/api/health` reports `"ai_enabled": true`; answers stream token by token.
+
+Z.ai serves **coding-plan** keys from `/api/coding/paas/v4` and general keys from
+`/api/paas/v4` — a key used against the wrong one returns 401. Mainland-China accounts use
+`https://open.bigmodel.cn/api/paas/v4`. The protocol is OpenAI-compatible, so only
+`LLM_BASE_URL` changes; it also points at OpenRouter, Groq or a local vLLM unchanged.
 
 Without a key nothing breaks: the assistant answers from the analysed corpus instead, and
 says so. Replies are never canned — see *Grounding* below.
@@ -169,8 +180,8 @@ tests/               pytest suite
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `ZAI_API_KEY` | unset | Enables the Z.ai assistant and AI report generation |
-| `LLM_BASE_URL` | `https://api.z.ai/api/paas/v4` | Any OpenAI-compatible endpoint |
-| `LLM_MODEL` | `glm-4.6` | Model id |
+| `LLM_BASE_URL` | `https://api.z.ai/api/coding/paas/v4` | Any OpenAI-compatible endpoint |
+| `LLM_MODEL` | `glm-5.2` | Model id |
 | `LLM_THINKING` | `false` | GLM-4.5+ reasoning mode (slower) |
 | `WATSONX_API_KEY` / `WATSONX_PROJECT_ID` | unset | Secondary provider; also used for crime classification |
 | `FIR_STORAGE` | `auto` | `auto` \| `memory` \| `mongodb` (fail if unreachable) |
@@ -189,7 +200,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-146 tests cover identity resolution, entity extraction, the storage backend, the
+148 tests cover identity resolution, entity extraction, the storage backend, the
 deterministic answerer, the LLM client (request shape, streaming, every failure mode,
 prompt grounding), the SSE endpoints, the crime drill-down, and every HTTP endpoint
 including error paths.
@@ -203,6 +214,9 @@ LLM_BASE_URL=http://127.0.0.1:8899/v1 ZAI_API_KEY=dev-key python main.py
 ```
 
 `MOCK_LLM_FAIL=500` makes it fail, so the fallback path can be checked too.
+
+The suite blanks provider credentials in `tests/conftest.py`, so `pytest` behaves the same
+with or without a real `.env` and never makes a billable call.
 
 ## IBM Bob CLI (MCP)
 
