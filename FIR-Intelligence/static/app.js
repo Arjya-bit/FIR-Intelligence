@@ -1,3 +1,4 @@
+function _extends() { return _extends = Object.assign ? Object.assign.bind() : function (n) { for (var e = 1; e < arguments.length; e++) { var t = arguments[e]; for (var r in t) ({}).hasOwnProperty.call(t, r) && (n[r] = t[r]); } return n; }, _extends.apply(null, arguments); }
 /**
  * FIR Intelligence dashboard.
  *
@@ -32,12 +33,35 @@ const {
 } = Recharts;
 const API = '/api';
 const COLORS = ['#5b9bff', '#fb5a75', '#1fc08f', '#f7a53b', '#b49bff', '#3cddf0', '#f887c4', '#fd9c52', '#14b8a6', '#6366f1', '#818cf8', '#e11d48', '#84cc16', '#0ea5e9', '#d946ef'];
+/**
+ * Reserved status palette for severity and risk — never reused as a series
+ * colour. The previous `high`/`medium` pair measured ΔE 3.4 in *normal* vision,
+ * so the two bands were indistinguishable for everyone, not just CVD readers.
+ * `mark` values sit on chart fills, `text` values on the darker card surface
+ * where a fill colour would not clear the contrast floor.
+ */
 const RISK_COLOR = {
-  critical: '#fb5a75',
-  high: '#fd9c52',
-  medium: '#f7a53b',
-  low: '#1fc08f'
+  critical: '#d03b3b',
+  high: '#ec835a',
+  medium: '#fab219',
+  low: '#0ca30c'
 };
+const RISK_TEXT = {
+  critical: '#f2777a',
+  high: '#f5a887',
+  medium: '#fac858',
+  low: '#4fd45a'
+};
+
+/**
+ * Magnitude comparisons use one hue, because bar length already encodes the
+ * value — a second encoding in colour adds nothing and, past eight categories,
+ * forces generated hues that are indistinguishable under colour-vision
+ * deficiency. Colour is reserved here for selection state.
+ */
+const BAR_HUE = '#3987e5';
+const BAR_HUE_DIM = 'rgba(57,135,229,.35)';
+const BAR_HUE_BRIGHT = '#7fb3f5';
 const CHART_TOOLTIP = {
   contentStyle: {
     background: '#151d35',
@@ -617,7 +641,11 @@ function CrimeDrilldown({
       borderRadius: 3,
       background: RISK_COLOR[band]
     }
-  }), band, ": ", d.severity_distribution[band]))), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: RISK_TEXT[band]
+    }
+  }, band), ": ", d.severity_distribution[band]))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'grid',
       gridTemplateColumns: 'repeat(auto-fit,minmax(260px,1fr))',
@@ -928,6 +956,8 @@ function Dashboard({
     }, ['critical', 'high', 'medium', 'low'].map(level => {
       const pct = (sev[level] || 0) / totalSev * 100;
       if (pct <= 0) return null;
+      // Dark ink on the light fills, light ink on the dark ones.
+      const ink = level === 'critical' || level === 'low' ? '#ffffff' : '#231a05';
       return /*#__PURE__*/React.createElement("div", {
         key: level,
         title: `${level}: ${sev[level]}`,
@@ -939,7 +969,7 @@ function Dashboard({
           justifyContent: 'center',
           fontSize: 11,
           fontWeight: 700,
-          color: '#0a0e1a'
+          color: ink
         }
       }, pct > 9 ? `${level.toUpperCase()} ${sev[level]}` : '');
     })), /*#__PURE__*/React.createElement("div", {
@@ -966,102 +996,141 @@ function Dashboard({
         borderRadius: 3,
         background: RISK_COLOR[l]
       }
-    }), l, ": ", sev[l] || 0)))), /*#__PURE__*/React.createElement("div", {
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: RISK_TEXT[l]
+      }
+    }, l), ": ", sev[l] || 0)))), /*#__PURE__*/React.createElement("div", {
       className: "grid-2"
     }, /*#__PURE__*/React.createElement(SectionCard, {
       title: "Crime Type Distribution",
-      subtitle: "Select a segment to break that offence down"
+      subtitle: `All ${crimeData.length} offence types · select one to break it down`
     }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
       width: "100%",
-      height: 280
-    }, /*#__PURE__*/React.createElement(PieChart, {
-      margin: {
-        top: 8,
-        right: 70,
-        bottom: 8,
-        left: 70
-      }
-    }, /*#__PURE__*/React.createElement(Pie, {
+      height: Math.max(300, crimeData.length * 26)
+    }, /*#__PURE__*/React.createElement(BarChart, {
       data: crimeData,
-      dataKey: "value",
-      nameKey: "name",
-      cx: "50%",
-      cy: "50%",
-      outerRadius: 88,
-      innerRadius: 52,
-      paddingAngle: 2,
-      minAngle: 2,
-      label: ({
-        name,
-        percent
-      }) => percent > .045 ? `${name} ${(percent * 100).toFixed(0)}%` : '',
-      labelLine: {
-        stroke: '#5b9bff',
-        strokeWidth: 1
+      layout: "vertical",
+      margin: {
+        top: 4,
+        right: 52,
+        bottom: 4,
+        left: 4
       },
+      barCategoryGap: 4
+    }, /*#__PURE__*/React.createElement(CartesianGrid, {
+      strokeDasharray: "3 3",
+      stroke: "#1c2748",
+      horizontal: false
+    }), /*#__PURE__*/React.createElement(XAxis, {
+      type: "number",
+      stroke: "#9dafd4",
+      tick: {
+        fontSize: 11
+      },
+      allowDecimals: false
+    }), /*#__PURE__*/React.createElement(YAxis, {
+      type: "category",
+      dataKey: "name",
+      width: 112,
+      stroke: "#9dafd4",
+      tick: {
+        fontSize: 12,
+        fill: '#dbe4f7'
+      },
+      interval: 0
+    }), /*#__PURE__*/React.createElement(Tooltip, _extends({}, CHART_TOOLTIP, {
+      cursor: {
+        fill: 'rgba(91,155,255,.08)'
+      },
+      formatter: (value, _n, entry) => [`${value} FIRs (${(value / (data.total_firs || 1) * 100).toFixed(1)}%)`, titleCase(entry?.payload?.name || '')]
+    })), /*#__PURE__*/React.createElement(Bar, {
+      dataKey: "value",
+      radius: [0, 4, 4, 0],
       isAnimationActive: false,
-      onClick: slice => setSelectedCrime(current => current === slice.key ? null : slice.key),
+      onClick: bar => setSelectedCrime(current => current === bar.key ? null : bar.key),
       style: {
-        cursor: 'pointer',
-        outline: 'none'
+        cursor: 'pointer'
+      },
+      label: {
+        position: 'right',
+        fill: '#9dafd4',
+        fontSize: 11
       }
-    }, crimeData.map((entry, i) => /*#__PURE__*/React.createElement(Cell, {
-      key: i,
-      fill: COLORS[i % COLORS.length],
-      stroke: selectedCrime === entry.key ? '#edf2ff' : undefined,
-      strokeWidth: selectedCrime === entry.key ? 2.5 : 0,
-      fillOpacity: selectedCrime && selectedCrime !== entry.key ? .35 : 1
-    }))), /*#__PURE__*/React.createElement(Tooltip, CHART_TOOLTIP))), /*#__PURE__*/React.createElement("div", {
+    }, crimeData.map(entry => /*#__PURE__*/React.createElement(Cell, {
+      key: entry.key,
+      fill: selectedCrime === entry.key ? BAR_HUE_BRIGHT : selectedCrime ? BAR_HUE_DIM : BAR_HUE
+    }))))), /*#__PURE__*/React.createElement("div", {
       style: {
         display: 'flex',
         flexWrap: 'wrap',
         gap: 5,
-        marginTop: 10
+        marginTop: 12
       }
-    }, crimeData.map((entry, i) => /*#__PURE__*/React.createElement("button", {
+    }, crimeData.map(entry => /*#__PURE__*/React.createElement("button", {
       key: entry.key,
       className: "chip chip-btn",
       "aria-pressed": selectedCrime === entry.key,
       onClick: () => setSelectedCrime(selectedCrime === entry.key ? null : entry.key),
       style: {
-        borderColor: selectedCrime === entry.key ? COLORS[i % COLORS.length] : 'var(--border)',
-        color: COLORS[i % COLORS.length],
-        background: selectedCrime === entry.key ? COLORS[i % COLORS.length] + '25' : 'transparent'
+        borderColor: selectedCrime === entry.key ? BAR_HUE_BRIGHT : 'var(--border)',
+        color: selectedCrime === entry.key ? BAR_HUE_BRIGHT : 'var(--text2)',
+        background: selectedCrime === entry.key ? 'rgba(57,135,229,.22)' : 'transparent'
       }
-    }, entry.name, " ", entry.value)))), /*#__PURE__*/React.createElement(SectionCard, {
-      title: "FIRs by District"
+    }, entry.name, " \xB7 ", entry.value)))), /*#__PURE__*/React.createElement(SectionCard, {
+      title: "FIRs by District",
+      subtitle: `All ${districtData.length} districts`
     }, /*#__PURE__*/React.createElement(ResponsiveContainer, {
       width: "100%",
-      height: 280
+      height: Math.max(300, districtData.length * 26)
     }, /*#__PURE__*/React.createElement(BarChart, {
       data: districtData,
+      layout: "vertical",
       margin: {
-        bottom: 34
-      }
+        top: 4,
+        right: 52,
+        bottom: 4,
+        left: 4
+      },
+      barCategoryGap: 4
     }, /*#__PURE__*/React.createElement(CartesianGrid, {
       strokeDasharray: "3 3",
-      stroke: "#1c2748"
+      stroke: "#1c2748",
+      horizontal: false
     }), /*#__PURE__*/React.createElement(XAxis, {
-      dataKey: "name",
+      type: "number",
       stroke: "#9dafd4",
       tick: {
         fontSize: 11
       },
-      angle: -35,
-      textAnchor: "end",
-      interval: 0,
-      height: 60
-    }), /*#__PURE__*/React.createElement(YAxis, {
-      stroke: "#9dafd4",
       allowDecimals: false
-    }), /*#__PURE__*/React.createElement(Tooltip, CHART_TOOLTIP), /*#__PURE__*/React.createElement(Bar, {
+    }), /*#__PURE__*/React.createElement(YAxis, {
+      type: "category",
+      dataKey: "name",
+      width: 112,
+      stroke: "#9dafd4",
+      tick: {
+        fontSize: 12,
+        fill: '#dbe4f7'
+      },
+      interval: 0
+    }), /*#__PURE__*/React.createElement(Tooltip, _extends({}, CHART_TOOLTIP, {
+      cursor: {
+        fill: 'rgba(91,155,255,.08)'
+      },
+      formatter: value => [`${value} FIRs`, 'Caseload']
+    })), /*#__PURE__*/React.createElement(Bar, {
       dataKey: "value",
-      radius: [6, 6, 0, 0],
-      isAnimationActive: false
-    }, districtData.map((_, i) => /*#__PURE__*/React.createElement(Cell, {
-      key: i,
-      fill: COLORS[i % COLORS.length]
-    }))))))), selectedCrime && /*#__PURE__*/React.createElement(CrimeDrilldown, {
+      radius: [0, 4, 4, 0],
+      isAnimationActive: false,
+      fill: BAR_HUE,
+      name: "FIRs",
+      label: {
+        position: 'right',
+        fill: '#9dafd4',
+        fontSize: 11
+      }
+    }))))), selectedCrime && /*#__PURE__*/React.createElement(CrimeDrilldown, {
       crimeType: selectedCrime,
       onClose: () => setSelectedCrime(null),
       onOpenFIR: onOpenFIR
@@ -1302,7 +1371,17 @@ function FIRList({
   }, data => /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("p", {
     className: "muted",
     "aria-live": "polite"
-  }, "Showing ", data.offset + 1, "\u2013", data.offset + data.items.length, " of ", data.total, " records"), data.items.map(fir => /*#__PURE__*/React.createElement("button", {
+  }, "Showing ", data.offset + 1, "\u2013", data.offset + data.items.length, " of ", data.total, " records"), data.pii_redacted && /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 12,
+      padding: '8px 12px',
+      borderRadius: 8,
+      background: 'rgba(250,178,25,.10)',
+      border: '1px solid rgba(250,178,25,.3)',
+      color: 'var(--amber)'
+    }
+  }, "Identities and narratives are redacted for your role. Viewing them requires the ", /*#__PURE__*/React.createElement("code", null, "fir:read_pii"), " permission."), data.items.map(fir => /*#__PURE__*/React.createElement("button", {
     key: fir.fir_number,
     className: "row-card",
     "aria-expanded": selected === fir.fir_number,
@@ -1790,7 +1869,7 @@ function CrimeTrends({
         width: 28,
         textAlign: 'center',
         fontWeight: 700,
-        color: COLORS[i % COLORS.length]
+        color: 'var(--text3)'
       }
     }, "#", i + 1), /*#__PURE__*/React.createElement("span", {
       style: {
@@ -1803,15 +1882,15 @@ function CrimeTrends({
       style: {
         flex: 1,
         background: 'var(--bg2)',
-        borderRadius: 20,
-        height: 24,
+        borderRadius: 6,
+        height: 22,
         overflow: 'hidden',
         minWidth: 60
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         height: '100%',
-        borderRadius: 20,
+        borderRadius: 6,
         display: 'flex',
         alignItems: 'center',
         paddingLeft: 10,
@@ -1819,7 +1898,7 @@ function CrimeTrends({
         fontWeight: 700,
         color: '#0a0e1a',
         width: `${Math.max(count / maxCrime * 100, 12)}%`,
-        background: `linear-gradient(90deg,${COLORS[i % COLORS.length]},${COLORS[i % COLORS.length]}aa)`
+        background: BAR_HUE
       }
     }, count)))))), /*#__PURE__*/React.createElement(SectionCard, {
       title: "District Crime Comparison"
@@ -1849,13 +1928,11 @@ function CrimeTrends({
       allowDecimals: false
     }), /*#__PURE__*/React.createElement(Tooltip, CHART_TOOLTIP), /*#__PURE__*/React.createElement(Bar, {
       dataKey: "value",
-      radius: [6, 6, 0, 0],
+      radius: [4, 4, 0, 0],
       isAnimationActive: false,
-      name: "FIRs"
-    }, districtData.map((_, i) => /*#__PURE__*/React.createElement(Cell, {
-      key: i,
-      fill: COLORS[i % COLORS.length]
-    })))))));
+      name: "FIRs",
+      fill: BAR_HUE
+    })))));
   });
 }
 
@@ -2022,7 +2099,7 @@ function NetworkView() {
   }, "Crime Network Intelligence"), /*#__PURE__*/React.createElement("p", {
     className: "muted"
   }, "Cross-FIR correlation identified ", networks.length, " clusters. Clusters are grown from the strongest links first and capped, so a common offence pattern cannot chain unrelated cases into one false network.")), networks.map((net, i) => {
-    const c = COLORS[i % COLORS.length];
+    const c = RISK_COLOR[net.risk_level] || BAR_HUE;
     const members = net.key_members || [];
     const firs = net.fir_numbers || [];
     const shown = firs.slice(0, 10);
@@ -2598,26 +2675,28 @@ function ChatDock({
 }
 
 // ── Report ─────────────────────────────────────────────────────────────────
+//: One-click starting points. The text is sent verbatim to the generator, so
+//: an officer can edit any of them into the request they actually want.
 const REPORT_FOCUS = [{
   value: '',
   label: 'Full briefing'
 }, {
-  value: 'repeat offenders and their cross-district movement',
+  value: 'repeat offenders and their movement across district boundaries',
   label: 'Repeat offenders'
 }, {
-  value: 'organised crime networks and their structure',
+  value: 'organised crime networks, their membership and their structure',
   label: 'Organised networks'
 }, {
-  value: 'district and station resourcing priorities',
+  value: 'where to deploy officers: district and station resourcing priorities',
   label: 'Resourcing'
 }, {
-  value: 'the most severe and time-critical cases',
+  value: 'the most severe and time-critical cases needing immediate action',
   label: 'Severity triage'
 }, {
-  value: 'cyber and financial crime',
+  value: 'cyber-enabled and financial crime',
   label: 'Cyber & fraud'
 }, {
-  value: 'narcotics and the supply chain',
+  value: 'narcotics offences and the supply chain behind them',
   label: 'Narcotics'
 }];
 
@@ -2628,6 +2707,7 @@ const REPORT_FOCUS = [{
  */
 function ReportView() {
   const [focus, setFocus] = useState('');
+  const [draft, setDraft] = useState('');
   const [report, setReport] = useState('');
   const [meta, setMeta] = useState(null);
   const [status, setStatus] = useState(null);
@@ -2703,21 +2783,7 @@ function ReportView() {
       flexWrap: 'wrap'
     },
     className: "no-print"
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
-    className: "sr-only",
-    htmlFor: "report-focus"
-  }, "Report focus"), /*#__PURE__*/React.createElement("select", {
-    id: "report-focus",
-    value: focus,
-    disabled: busy,
-    onChange: e => {
-      setFocus(e.target.value);
-      generate(e.target.value);
-    }
-  }, REPORT_FOCUS.map(f => /*#__PURE__*/React.createElement("option", {
-    key: f.label,
-    value: f.value
-  }, f.label)))), busy ? /*#__PURE__*/React.createElement("button", {
+  }, busy ? /*#__PURE__*/React.createElement("button", {
     className: "btn btn-ghost",
     onClick: () => abortRef.current?.abort()
   }, "Stop") : /*#__PURE__*/React.createElement("button", {
@@ -2731,7 +2797,80 @@ function ReportView() {
     className: "btn btn-primary",
     onClick: () => download('txt'),
     disabled: !report || busy
-  }, "Download"))), meta && /*#__PURE__*/React.createElement("div", {
+  }, "Download"))), /*#__PURE__*/React.createElement(SectionCard, {
+    title: "What should this briefing cover?",
+    subtitle: "Describe the report you need, or start from a preset."
+  }, /*#__PURE__*/React.createElement("form", {
+    className: "toolbar",
+    onSubmit: e => {
+      e.preventDefault();
+      const text = draft.trim();
+      setFocus(text);
+      generate(text);
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: '1 1 320px'
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    className: "sr-only",
+    htmlFor: "report-prompt"
+  }, "Report request"), /*#__PURE__*/React.createElement("input", {
+    id: "report-prompt",
+    type: "text",
+    value: draft,
+    style: {
+      width: '100%'
+    },
+    placeholder: "e.g. brief me on cross-district offenders in Lucknow and Kanpur for a task force",
+    onChange: e => setDraft(e.target.value)
+  })), /*#__PURE__*/React.createElement("button", {
+    type: "submit",
+    className: "btn btn-primary",
+    disabled: busy
+  }, busy ? 'Generating…' : 'Generate'), focus && !busy && /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    className: "btn btn-ghost",
+    onClick: () => {
+      setDraft('');
+      setFocus('');
+      generate('');
+    }
+  }, "Clear focus")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: 6,
+      marginTop: 12
+    }
+  }, REPORT_FOCUS.map(f => /*#__PURE__*/React.createElement("button", {
+    key: f.label,
+    className: "btn btn-ghost",
+    disabled: busy,
+    "aria-pressed": focus === f.value,
+    onClick: () => {
+      setDraft(f.value);
+      setFocus(f.value);
+      generate(f.value);
+    },
+    style: {
+      fontSize: 12,
+      padding: '6px 12px',
+      borderRadius: 20,
+      borderColor: focus === f.value ? BAR_HUE_BRIGHT : 'var(--border)',
+      color: focus === f.value ? BAR_HUE_BRIGHT : 'var(--text2)'
+    }
+  }, f.label))), focus && /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 12,
+      marginTop: 12
+    }
+  }, "Current focus: ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: 'var(--text)'
+    }
+  }, focus))), meta && /*#__PURE__*/React.createElement("div", {
     className: "metric-grid"
   }, [['FIRs Analysed', meta.total_firs, 'var(--blue)'], ['Repeat Offenders', meta.repeat_offender_count, 'var(--red)'], ['Districts', (meta.districts || []).length, 'var(--green)'], ['Networks', (meta.patterns || []).length, 'var(--amber)'], ['Stations', meta.stations_analysed, 'var(--cyan)']].map(([k, v, c]) => /*#__PURE__*/React.createElement("div", {
     key: k,
@@ -2932,48 +3071,569 @@ function UploadPanel({
   }, "index ", e.index, ": ", e.error)))));
 }
 
+// ── Authentication ─────────────────────────────────────────────────────────
+
+/** Session state. `null` user with `checked` true means "show the login screen". */
+function useSession() {
+  const [state, setState] = useState({
+    user: null,
+    authEnabled: true,
+    checked: false
+  });
+  const refresh = useCallback(async () => {
+    try {
+      const data = await apiGet('/auth/me');
+      setState({
+        user: data.user,
+        authEnabled: data.auth_enabled,
+        checked: true
+      });
+    } catch {
+      setState(s => ({
+        ...s,
+        user: null,
+        checked: true
+      }));
+    }
+  }, []);
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+  const signIn = useCallback(async (username, password) => {
+    const res = await fetch(API + '/auth/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        username,
+        password
+      })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `Sign-in failed (${res.status})`);
+    setState({
+      user: body.user,
+      authEnabled: body.auth_enabled,
+      checked: true
+    });
+    return body.user;
+  }, []);
+  const signOut = useCallback(async () => {
+    await fetch(API + '/auth/logout', {
+      method: 'POST'
+    }).catch(() => {});
+    setState(s => ({
+      ...s,
+      user: null,
+      checked: true
+    }));
+  }, []);
+  return {
+    ...state,
+    signIn,
+    signOut,
+    refresh
+  };
+}
+function LoginScreen({
+  session
+}) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const roles = useApi('/auth/roles');
+  const userRef = useRef(null);
+  useEffect(() => {
+    userRef.current?.focus();
+  }, []);
+  const submit = async e => {
+    e.preventDefault();
+    if (!username.trim() || !password) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await session.signIn(username.trim(), password);
+    } catch (err) {
+      setError(err.message);
+      setPassword('');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      minHeight: '100vh',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: '32px 16px'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: '100%',
+      maxWidth: 960,
+      display: 'grid',
+      gridTemplateColumns: 'minmax(300px,380px) 1fr',
+      gap: 24
+    },
+    className: "login-grid"
+  }, /*#__PURE__*/React.createElement("form", {
+    onSubmit: submit,
+    className: "glass p-5 glow",
+    style: {
+      alignSelf: 'start'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      marginBottom: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    "aria-hidden": "true",
+    style: {
+      width: 44,
+      height: 44,
+      borderRadius: 10,
+      background: 'linear-gradient(135deg,#2563eb,#5b9bff)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontWeight: 800,
+      color: '#fff'
+    }
+  }, "FI"), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("h1", {
+    style: {
+      fontSize: 17,
+      fontWeight: 700
+    }
+  }, "FIR Intelligence System"), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, "Restricted \u2014 authorised personnel only"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    htmlFor: "login-user"
+  }, "Username"), /*#__PURE__*/React.createElement("input", {
+    id: "login-user",
+    ref: userRef,
+    value: username,
+    autoComplete: "username",
+    style: {
+      width: '100%'
+    },
+    onChange: e => setUsername(e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    htmlFor: "login-pass"
+  }, "Password"), /*#__PURE__*/React.createElement("input", {
+    id: "login-pass",
+    type: "password",
+    value: password,
+    autoComplete: "current-password",
+    style: {
+      width: '100%'
+    },
+    onChange: e => setPassword(e.target.value)
+  })), error && /*#__PURE__*/React.createElement("p", {
+    role: "alert",
+    style: {
+      fontSize: 13,
+      color: 'var(--red)',
+      marginBottom: 12,
+      padding: 10,
+      borderRadius: 8,
+      background: 'rgba(208,59,59,.12)',
+      border: '1px solid rgba(208,59,59,.35)'
+    }
+  }, error), /*#__PURE__*/React.createElement("button", {
+    type: "submit",
+    className: "btn btn-primary",
+    disabled: busy,
+    style: {
+      width: '100%'
+    }
+  }, busy ? 'Signing in…' : 'Sign in'), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11,
+      marginTop: 14
+    }
+  }, "Accounts are locked for 5 minutes after 5 failed attempts.")), /*#__PURE__*/React.createElement("div", {
+    className: "glass p-5"
+  }, /*#__PURE__*/React.createElement("h2", {
+    style: {
+      fontSize: 15,
+      fontWeight: 700,
+      marginBottom: 4
+    }
+  }, "Roles"), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      marginBottom: 14
+    }
+  }, "Access is granted by role. Roles without ", /*#__PURE__*/React.createElement("code", null, "fir:read_pii"), " see FIR narratives and identities redacted."), /*#__PURE__*/React.createElement(Async, {
+    state: roles
+  }, list => /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 10
+    }
+  }, list.map(role => /*#__PURE__*/React.createElement("div", {
+    key: role.role,
+    style: {
+      padding: 12,
+      borderRadius: 8,
+      background: 'var(--bg2)'
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      justifyContent: 'space-between',
+      gap: 8,
+      alignItems: 'baseline',
+      flexWrap: 'wrap'
+    }
+  }, /*#__PURE__*/React.createElement("strong", {
+    style: {
+      fontSize: 13
+    }
+  }, role.label), /*#__PURE__*/React.createElement("code", {
+    style: {
+      fontSize: 11,
+      color: 'var(--blue)'
+    }
+  }, role.role)), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 12,
+      marginTop: 4
+    }
+  }, role.description))))))));
+}
+
+/** Shown in place of a tab the signed-in role may not use. */
+function NoAccess({
+  permission,
+  role
+}) {
+  return /*#__PURE__*/React.createElement(EmptyState, {
+    title: "You do not have access to this view",
+    hint: `This section requires the “${permission}” permission, which the ${role} role does not hold.`
+  });
+}
+function AccountPanel({
+  session
+}) {
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const user = session.user;
+  const isAdmin = user.permissions.includes('admin:users');
+  const users = useApi(isAdmin ? '/auth/users' : '/auth/me');
+  const submit = async e => {
+    e.preventDefault();
+    setStatus(null);
+    if (next !== confirm) {
+      setStatus({
+        error: true,
+        text: 'New passwords do not match.'
+      });
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await fetch(API + '/auth/password', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          current_password: current,
+          new_password: next
+        })
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `Failed (${res.status})`);
+      setStatus({
+        text: 'Password updated.'
+      });
+      setCurrent('');
+      setNext('');
+      setConfirm('');
+    } catch (err) {
+      setStatus({
+        error: true,
+        text: err.message
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "stack fade-in"
+  }, /*#__PURE__*/React.createElement(SectionCard, {
+    title: "Signed in as",
+    subtitle: user.role_description
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "metric-grid"
+  }, [['Username', user.username], ['Name', user.full_name || '—'], ['Role', user.role_label], ['Station', user.station || '—'], ['District', user.district || '—']].map(([k, v]) => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    style: {
+      padding: 10,
+      borderRadius: 8,
+      background: 'var(--bg2)'
+    }
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 11
+    }
+  }, k), /*#__PURE__*/React.createElement("p", {
+    style: {
+      fontWeight: 600,
+      fontSize: 13
+    }
+  }, v)))), /*#__PURE__*/React.createElement("p", {
+    className: "muted",
+    style: {
+      fontSize: 12,
+      marginTop: 12,
+      marginBottom: 6
+    }
+  }, "Permissions"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      flexWrap: 'wrap',
+      gap: 5
+    }
+  }, user.permissions.map(p => /*#__PURE__*/React.createElement("span", {
+    key: p,
+    className: "chip",
+    style: {
+      background: 'rgba(57,135,229,.14)',
+      color: 'var(--blue)'
+    }
+  }, p)))), /*#__PURE__*/React.createElement(SectionCard, {
+    title: "Change password",
+    subtitle: "At least 10 characters with upper case, lower case and a digit."
+  }, /*#__PURE__*/React.createElement("form", {
+    onSubmit: submit,
+    className: "toolbar"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: '1 1 180px'
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    htmlFor: "pw-cur"
+  }, "Current"), /*#__PURE__*/React.createElement("input", {
+    id: "pw-cur",
+    type: "password",
+    value: current,
+    style: {
+      width: '100%'
+    },
+    autoComplete: "current-password",
+    onChange: e => setCurrent(e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: '1 1 180px'
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    htmlFor: "pw-new"
+  }, "New"), /*#__PURE__*/React.createElement("input", {
+    id: "pw-new",
+    type: "password",
+    value: next,
+    style: {
+      width: '100%'
+    },
+    autoComplete: "new-password",
+    onChange: e => setNext(e.target.value)
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: '1 1 180px'
+    }
+  }, /*#__PURE__*/React.createElement("label", {
+    htmlFor: "pw-confirm"
+  }, "Confirm"), /*#__PURE__*/React.createElement("input", {
+    id: "pw-confirm",
+    type: "password",
+    value: confirm,
+    style: {
+      width: '100%'
+    },
+    autoComplete: "new-password",
+    onChange: e => setConfirm(e.target.value)
+  })), /*#__PURE__*/React.createElement("button", {
+    type: "submit",
+    className: "btn btn-primary",
+    disabled: busy || !current || !next
+  }, "Update")), status && /*#__PURE__*/React.createElement("p", {
+    role: "status",
+    style: {
+      marginTop: 10,
+      fontSize: 13,
+      color: status.error ? 'var(--red)' : 'var(--green)'
+    }
+  }, status.text)), isAdmin && /*#__PURE__*/React.createElement(SectionCard, {
+    title: "Accounts",
+    subtitle: "Every account on this deployment."
+  }, /*#__PURE__*/React.createElement(Async, {
+    state: users,
+    isEmpty: d => !Array.isArray(d) || !d.length,
+    empty: /*#__PURE__*/React.createElement(EmptyState, {
+      title: "No accounts"
+    })
+  }, list => /*#__PURE__*/React.createElement("div", {
+    style: {
+      overflowX: 'auto'
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: '100%',
+      borderCollapse: 'collapse',
+      fontSize: 13
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      textAlign: 'left',
+      color: 'var(--text2)'
+    }
+  }, ['Username', 'Name', 'Role', 'Station', 'Status', 'Last sign-in'].map(h => /*#__PURE__*/React.createElement("th", {
+    key: h,
+    style: {
+      padding: '8px 10px',
+      borderBottom: '1px solid var(--border)',
+      fontSize: 11,
+      fontWeight: 700
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, list.map(u => /*#__PURE__*/React.createElement("tr", {
+    key: u.username
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '8px 10px',
+      fontFamily: 'ui-monospace,Menlo,monospace',
+      color: 'var(--blue)'
+    }
+  }, u.username), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '8px 10px'
+    }
+  }, u.full_name || '—'), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '8px 10px'
+    }
+  }, u.role_label), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '8px 10px'
+    }
+  }, u.station || '—'), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '8px 10px'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    className: `badge badge-${u.active ? 'low' : 'critical'}`
+  }, u.active ? 'active' : 'disabled')), /*#__PURE__*/React.createElement("td", {
+    style: {
+      padding: '8px 10px',
+      color: 'var(--text2)'
+    }
+  }, u.last_login ? new Date(u.last_login).toLocaleString() : 'never')))))))));
+}
+
 // ── App shell ──────────────────────────────────────────────────────────────
 const TABS = [{
   id: 'dashboard',
   label: 'Dashboard',
-  icon: '📊'
+  icon: '📊',
+  permission: 'analytics:read'
 }, {
   id: 'firs',
   label: 'FIR Records',
-  icon: '📋'
+  icon: '📋',
+  permission: 'fir:read'
 }, {
   id: 'offenders',
   label: 'Repeat Offenders',
-  icon: '🔁'
+  icon: '🔁',
+  permission: 'offender:read'
 }, {
   id: 'trends',
   label: 'Crime Trends',
-  icon: '📈'
+  icon: '📈',
+  permission: 'analytics:read'
 }, {
   id: 'stations',
   label: 'Station Analysis',
-  icon: '🏛'
+  icon: '🏛',
+  permission: 'analytics:read'
 }, {
   id: 'networks',
   label: 'Crime Networks',
-  icon: '🕸'
+  icon: '🕸',
+  permission: 'analytics:read'
 }, {
   id: 'chat',
   label: 'Ask Bob',
-  icon: '🤖'
+  icon: '🤖',
+  permission: 'assistant:use'
 }, {
   id: 'report',
   label: 'Intel Report',
-  icon: '📄'
+  icon: '📄',
+  permission: 'report:generate'
 }, {
   id: 'upload',
   label: 'Ingest FIRs',
-  icon: '⬆'
+  icon: '⬆',
+  permission: 'fir:ingest'
+}, {
+  id: 'account',
+  label: 'Account',
+  icon: '👤',
+  permission: null
 }];
 function App() {
+  const session = useSession();
+  if (!session.checked) return /*#__PURE__*/React.createElement(Spinner, {
+    label: "Checking your session"
+  });
+  if (session.authEnabled && !session.user) return /*#__PURE__*/React.createElement(LoginScreen, {
+    session: session
+  });
+  return /*#__PURE__*/React.createElement(Workspace, {
+    session: session
+  });
+}
+function Workspace({
+  session
+}) {
+  const user = session.user;
+  const can = useCallback(permission => !permission || (user?.permissions || []).includes(permission), [user]);
+  // A role only ever sees the tabs it can actually open.
+  const tabs = useMemo(() => TABS.filter(t => can(t.permission)), [can]);
+
   // Deep-linkable tabs: the old build reset to the dashboard on every reload
   // and offered no way to share a view.
-  const [tab, setTab] = useState(() => TABS.some(t => t.id === window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'dashboard');
+  const [tab, setTab] = useState(() => {
+    const hash = window.location.hash.slice(1);
+    if (tabs.some(t => t.id === hash)) return hash;
+    return tabs[0]?.id || 'account';
+  });
   const dashboard = useApi('/dashboard');
   const health = useApi('/health');
   const tabRefs = useRef({});
@@ -2984,7 +3644,7 @@ function App() {
   useEffect(() => {
     const onHash = () => {
       const id = window.location.hash.slice(1);
-      if (TABS.some(t => t.id === id)) setTab(id);
+      if (tabs.some(t => t.id === id)) setTab(id);
     };
     window.addEventListener('hashchange', onHash);
     return () => window.removeEventListener('hashchange', onHash);
@@ -3003,9 +3663,9 @@ function App() {
 
   // Arrow-key navigation, as expected of an ARIA tablist.
   const onTabKey = e => {
-    const i = TABS.findIndex(t => t.id === tab);
+    const i = tabs.findIndex(t => t.id === tab);
     let next = null;
-    if (e.key === 'ArrowRight') next = TABS[(i + 1) % TABS.length];else if (e.key === 'ArrowLeft') next = TABS[(i - 1 + TABS.length) % TABS.length];else if (e.key === 'Home') next = TABS[0];else if (e.key === 'End') next = TABS[TABS.length - 1];
+    if (e.key === 'ArrowRight') next = tabs[(i + 1) % tabs.length];else if (e.key === 'ArrowLeft') next = tabs[(i - 1 + tabs.length) % tabs.length];else if (e.key === 'Home') next = tabs[0];else if (e.key === 'End') next = tabs[tabs.length - 1];
     if (next) {
       e.preventDefault();
       select(next.id);
@@ -3097,7 +3757,47 @@ function App() {
     style: {
       fontSize: 11
     }
-  }, status.firs_analyzed, " FIRs \xB7 ", status.language_model)))), /*#__PURE__*/React.createElement("nav", {
+  }, status.firs_analyzed, " FIRs \xB7 ", status.language_model), user && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: () => select('account'),
+    title: `${user.full_name || user.username} · ${user.role_label}`,
+    style: {
+      padding: '5px 12px',
+      fontSize: 12,
+      display: 'flex',
+      gap: 8,
+      alignItems: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    "aria-hidden": "true",
+    style: {
+      width: 22,
+      height: 22,
+      borderRadius: '50%',
+      background: 'var(--blue2)',
+      color: '#fff',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontSize: 11,
+      fontWeight: 700
+    }
+  }, (user.full_name || user.username).charAt(0).toUpperCase()), /*#__PURE__*/React.createElement("span", {
+    className: "header-stats"
+  }, user.role_label)), /*#__PURE__*/React.createElement("button", {
+    className: "btn btn-ghost",
+    onClick: session.signOut,
+    style: {
+      padding: '5px 12px',
+      fontSize: 12
+    }
+  }, "Sign out"))))), /*#__PURE__*/React.createElement("nav", {
     className: "shell",
     style: {
       padding: '12px 20px'
@@ -3113,7 +3813,7 @@ function App() {
       overflowX: 'auto',
       paddingBottom: 4
     }
-  }, TABS.map(t => /*#__PURE__*/React.createElement("button", {
+  }, tabs.map(t => /*#__PURE__*/React.createElement("button", {
     key: t.id,
     role: "tab",
     id: `tab-${t.id}`,
@@ -3142,23 +3842,61 @@ function App() {
     id: `panel-${tab}`,
     "aria-labelledby": `tab-${tab}`,
     tabIndex: -1
-  }, tab === 'dashboard' && /*#__PURE__*/React.createElement(Dashboard, {
-    state: dashboard,
-    onOpenFIR: openFIR
-  }), tab === 'firs' && /*#__PURE__*/React.createElement(FIRList, {
-    initialQuery: focusFIR
-  }), tab === 'offenders' && /*#__PURE__*/React.createElement(RepeatOffenders, {
-    threshold: dashboard.data?.name_match_threshold
-  }), tab === 'trends' && /*#__PURE__*/React.createElement(CrimeTrends, {
-    state: dashboard
-  }), tab === 'stations' && /*#__PURE__*/React.createElement(StationSummary, null), tab === 'networks' && /*#__PURE__*/React.createElement(NetworkView, null), tab === 'chat' && /*#__PURE__*/React.createElement(BobChat, {
-    chat: chat
-  }), tab === 'report' && /*#__PURE__*/React.createElement(ReportView, null), tab === 'upload' && /*#__PURE__*/React.createElement(UploadPanel, {
-    onIngested: () => {
-      dashboard.reload();
-      health.reload();
+  }, (() => {
+    const definition = TABS.find(t => t.id === tab);
+    // Deep links can point at a tab this role cannot open.
+    if (definition && !can(definition.permission)) {
+      return /*#__PURE__*/React.createElement(NoAccess, {
+        permission: definition.permission,
+        role: user.role_label
+      });
     }
-  }))), /*#__PURE__*/React.createElement("footer", {
+    switch (tab) {
+      case 'dashboard':
+        return /*#__PURE__*/React.createElement(Dashboard, {
+          state: dashboard,
+          onOpenFIR: openFIR
+        });
+      case 'firs':
+        return /*#__PURE__*/React.createElement(FIRList, {
+          initialQuery: focusFIR
+        });
+      case 'offenders':
+        return /*#__PURE__*/React.createElement(RepeatOffenders, {
+          threshold: dashboard.data?.name_match_threshold
+        });
+      case 'trends':
+        return /*#__PURE__*/React.createElement(CrimeTrends, {
+          state: dashboard
+        });
+      case 'stations':
+        return /*#__PURE__*/React.createElement(StationSummary, null);
+      case 'networks':
+        return /*#__PURE__*/React.createElement(NetworkView, null);
+      case 'chat':
+        return /*#__PURE__*/React.createElement(BobChat, {
+          chat: chat
+        });
+      case 'report':
+        return /*#__PURE__*/React.createElement(ReportView, null);
+      case 'upload':
+        return /*#__PURE__*/React.createElement(UploadPanel, {
+          onIngested: () => {
+            dashboard.reload();
+            health.reload();
+          }
+        });
+      case 'account':
+        return /*#__PURE__*/React.createElement(AccountPanel, {
+          session: session
+        });
+      default:
+        return /*#__PURE__*/React.createElement(Dashboard, {
+          state: dashboard,
+          onOpenFIR: openFIR
+        });
+    }
+  })())), /*#__PURE__*/React.createElement("footer", {
     style: {
       borderTop: '1px solid var(--border)',
       padding: '16px 20px',
@@ -3168,7 +3906,7 @@ function App() {
     }
   }, "FIR Intelligence & Crime Pattern Detector \xB7 FastAPI + React + Recharts \xB7 findings are automated correlations and require verification by the investigating officer"), /*#__PURE__*/React.createElement(ChatDock, {
     chat: chat,
-    hidden: tab === 'chat'
+    hidden: tab === 'chat' || !can('assistant:use')
   }));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));

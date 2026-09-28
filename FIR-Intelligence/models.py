@@ -138,6 +138,25 @@ class ChatRequest(BaseModel):
     history: list[ChatMessage] = []
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class NewUserRequest(BaseModel):
+    username: str
+    password: str
+    role: str
+    full_name: str = ""
+    station: str = ""
+    district: str = ""
+
+
 class ChatResponse(BaseModel):
     response: str
     entities_referenced: list[str] = []

@@ -16,12 +16,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
+                     Response, UploadFile)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, ORJSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
+import auth
 import database as db
 import intel_qa
 import llm_client
@@ -30,7 +32,8 @@ from bob_client import (
     generate_intelligence_report,
     is_configured as watsonx_configured,
 )
-from models import AnalysisResult, ChatRequest, ChatResponse, FIRRecord
+from models import (AnalysisResult, ChatRequest, ChatResponse, FIRRecord,
+                    LoginRequest, NewUserRequest, PasswordChangeRequest)
 from nlp_engine import analyze_fir_batch, get_analysis_context
 from pattern_detector import FUZZY_THRESHOLD, detect_crime_networks
 
@@ -38,6 +41,14 @@ STATIC_DIR = Path(__file__).parent / "static"
 SEED_VERSION = 3
 SEED_SIZE = int(os.getenv("FIR_SEED_SIZE", "100"))
 MAX_UPLOAD_BYTES = int(os.getenv("FIR_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+
+#: RBAC is on by default. Turning it off is for local development only and
+#: makes every request act as a full administrator.
+AUTH_ENABLED = os.getenv("FIR_AUTH_ENABLED", "true").strip().lower() not in {
+    "0", "false", "no", "off"}
+#: Cookies are marked Secure unless explicitly serving plain HTTP locally.
+COOKIE_SECURE = os.getenv("FIR_COOKIE_SECURE", "").strip().lower() in {
+    "1", "true", "yes"}
 
 #: Browsers reject ``Access-Control-Allow-Origin: *`` when credentials are
 #: allowed, so the wildcard default is paired with credentials disabled.
@@ -51,6 +62,55 @@ analysis_cache: AnalysisResult | None = None
 networks_cache: list[dict] = []
 #: Analysis rebuilds mutate shared state, so uploads must not interleave.
 _analysis_lock = asyncio.Lock()
+
+
+# ── Access control ─────────────────────────────────────────────────────────
+
+#: Stand-in identity when FIR_AUTH_ENABLED=false, so route handlers can always
+#: ask `user.can(...)` without branching on whether auth is on.
+_DEV_SUPERUSER = auth.User(username="dev", password_hash="", role="admin",
+                           full_name="Auth disabled (development)")
+
+
+def current_user(request: Request) -> auth.User:
+    """Resolve the signed session cookie to a user, or raise 401."""
+    if not AUTH_ENABLED:
+        return _DEV_SUPERUSER
+
+    token = request.cookies.get(auth.COOKIE_NAME)
+    payload = auth.read_token(token) if token else None
+    if not payload:
+        raise HTTPException(401, "Not signed in", headers={"WWW-Authenticate": "Cookie"})
+
+    user = auth.get_user(payload["sub"])
+    if not user or not user.active:
+        raise HTTPException(401, "Session no longer valid")
+    # The role is re-read from the store, not trusted from the token, so a
+    # demotion takes effect immediately instead of at the next login.
+    return user
+
+
+def requires(*permissions: str):
+    """Dependency factory enforcing every listed permission."""
+    def dependency(user: auth.User = Depends(current_user)) -> auth.User:
+        missing = [p for p in permissions if not user.can(p)]
+        if missing:
+            raise HTTPException(
+                403, f"Your role ({user.role}) lacks: {', '.join(missing)}")
+        return user
+    return dependency
+
+
+def _set_session_cookie(response: Response, user: auth.User) -> None:
+    response.set_cookie(
+        auth.COOKIE_NAME,
+        auth.issue_token(user.username, user.role),
+        max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True,          # unreadable from JavaScript
+        samesite="lax",         # blocks cross-site form submissions
+        secure=COOKIE_SECURE,
+        path="/",
+    )
 
 
 def _require_analysis() -> AnalysisResult:
@@ -195,6 +255,14 @@ async def lifespan(app: FastAPI):
     backend = await db.connect()
     await _seed_database()
 
+    if AUTH_ENABLED:
+        created = auth.seed_demo_users()
+        if created:
+            print(f"\nCreated {len(created)} demo accounts: {', '.join(created)}")
+    else:
+        print("\n!! RBAC DISABLED (FIR_AUTH_ENABLED=false) — every request has "
+              "full administrator access.")
+
     print("\nRunning NLP analysis...")
     async with _analysis_lock:
         await _run_analysis()
@@ -209,6 +277,21 @@ async def lifespan(app: FastAPI):
         print("           No LLM configured — answers are computed from the corpus. "
               "Set ZAI_API_KEY to enable the AI assistant.")
     print(f"Storage: {backend}")
+
+    if AUTH_ENABLED:
+        insecure = auth.using_demo_credentials()
+        print(f"Access control: enabled · {len(auth.list_users())} accounts · "
+              f"{len(auth.ROLE_ORDER)} roles")
+        if insecure:
+            print("  !! DEMO PASSWORDS STILL IN USE for: "
+                  f"{', '.join(insecure)}")
+            print("     They are published in the README. Change them before "
+                  "this is reachable by anyone else.")
+        if auth.SECRET_IS_EPHEMERAL:
+            print("  !! FIR_SECRET_KEY is not set — sessions are signed with a "
+                  "random per-process key,")
+            print("     so everyone is signed out when the server restarts.")
+
     print("\nDashboard: http://localhost:8000")
     print("API docs:  http://localhost:8000/docs")
     print("=" * 62)
@@ -252,11 +335,99 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # ── Meta ───────────────────────────────────────────────────────────────────
 
 
+# ── Authentication ─────────────────────────────────────────────────────────
+
+
+@app.post("/api/auth/login", tags=["auth"])
+async def login(req: LoginRequest, response: Response):
+    if not AUTH_ENABLED:
+        return {"user": _DEV_SUPERUSER.public(), "auth_enabled": False}
+    try:
+        user = auth.authenticate(req.username, req.password)
+    except auth.AuthError as exc:
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        raise HTTPException(401, str(exc), headers=headers) from exc
+    _set_session_cookie(response, user)
+    return {"user": user.public(), "auth_enabled": True}
+
+
+@app.post("/api/auth/logout", tags=["auth"])
+async def logout(response: Response):
+    response.delete_cookie(auth.COOKIE_NAME, path="/")
+    return {"detail": "Signed out"}
+
+
+@app.get("/api/auth/me", tags=["auth"])
+async def whoami(user: auth.User = Depends(current_user)):
+    return {"user": user.public(), "auth_enabled": AUTH_ENABLED}
+
+
+@app.get("/api/auth/roles", tags=["auth"])
+async def list_roles():
+    """Public: the login screen explains what each role can do."""
+    return [{"role": name, "label": entry["label"],
+             "description": entry["description"],
+             "permissions": sorted(entry["permissions"])}
+            for name, entry in ((r, auth.ROLES[r]) for r in auth.ROLE_ORDER)]
+
+
+@app.post("/api/auth/password", tags=["auth"])
+async def change_password(req: PasswordChangeRequest,
+                          user: auth.User = Depends(current_user)):
+    if not auth.verify_password(req.current_password, user.password_hash):
+        raise HTTPException(403, "Current password is incorrect.")
+    try:
+        auth.set_password(user.username, req.new_password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"detail": "Password updated."}
+
+
+@app.get("/api/auth/users", tags=["auth"])
+async def get_users(user: auth.User = Depends(requires(auth.ADMIN_USERS))):
+    return [u.public() for u in auth.list_users()]
+
+
+@app.post("/api/auth/users", tags=["auth"])
+async def add_user(req: NewUserRequest,
+                   user: auth.User = Depends(requires(auth.ADMIN_USERS))):
+    try:
+        created = auth.create_user(
+            req.username, req.password, req.role, full_name=req.full_name,
+            station=req.station, district=req.district)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return created.public()
+
+
+@app.post("/api/auth/users/{username}/active", tags=["auth"])
+async def set_user_active(username: str, active: bool = Query(...),
+                          user: auth.User = Depends(requires(auth.ADMIN_USERS))):
+    if username == user.username and not active:
+        raise HTTPException(400, "You cannot disable your own account.")
+    try:
+        return auth.set_active(username, active).public()
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/auth/users/{username}/role", tags=["auth"])
+async def set_user_role(username: str, role: str = Query(...),
+                        user: auth.User = Depends(requires(auth.ADMIN_USERS))):
+    if username == user.username:
+        raise HTTPException(400, "You cannot change your own role.")
+    try:
+        return auth.set_role(username, role).public()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/health", tags=["meta"])
 async def health():
     status = _llm_status()
     return {
         "status": "ok" if analysis_cache else "starting",
+        "auth_enabled": AUTH_ENABLED,
         "storage": db.backend_name(),
         "persistent": db.is_persistent(),
         "language_model": status["source"],
@@ -273,7 +444,7 @@ async def health():
 
 
 @app.get("/api/filters", tags=["meta"])
-async def get_filters():
+async def get_filters(user: auth.User = Depends(requires(auth.FIR_READ))):
     """Filter options, so the UI does not have to derive them from a full fetch."""
     result = _require_analysis()
     crime_types = sorted({r.crime_type.value if r.crime_type else "other"
@@ -290,7 +461,7 @@ async def get_filters():
 
 
 @app.get("/api/db-stats", tags=["meta"])
-async def db_stats():
+async def db_stats(user: auth.User = Depends(requires(auth.ANALYTICS_READ))):
     stats = await db.get_fir_stats()
     stats.pop("_id", None)
     return {
@@ -306,7 +477,7 @@ async def db_stats():
 
 
 @app.get("/api/dashboard", tags=["analytics"])
-async def get_dashboard():
+async def get_dashboard(user: auth.User = Depends(requires(auth.ANALYTICS_READ))):
     result = _require_analysis()
     stats = await db.get_fir_stats()
     return {
@@ -337,6 +508,7 @@ async def get_firs(
     q: str | None = Query(None, description="Free-text search across FIR content"),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
+    user: auth.User = Depends(requires(auth.FIR_READ)),
 ):
     """Paginated, filtered FIR list.
 
@@ -371,8 +543,13 @@ async def get_firs(
 
     records = sorted(records, key=lambda r: (r.date_filed, r.fir_number), reverse=True)
     page = records[offset:offset + limit]
+    show_pii = user.can(auth.FIR_READ_PII)
+    items = [_fir_payload(r) for r in page]
+    if not show_pii:
+        items = [auth.redact_fir(item) for item in items]
     return {
-        "items": [_fir_payload(r) for r in page],
+        "items": items,
+        "pii_redacted": not show_pii,
         "total": len(records),
         "limit": limit,
         "offset": offset,
@@ -381,14 +558,17 @@ async def get_firs(
 
 
 @app.get("/api/firs/{fir_number:path}", tags=["firs"])
-async def get_fir_detail(fir_number: str):
+async def get_fir_detail(
+        fir_number: str,
+        user: auth.User = Depends(requires(auth.FIR_READ))):
     """Full detail for one FIR. FIR numbers contain slashes, hence ``:path``."""
     result = _require_analysis()
     for record in result.fir_records:
         if record.fir_number == fir_number:
             payload = _fir_payload(record, full_text=True)
             payload["related"] = _related_firs(record, result)
-            return payload
+            return payload if user.can(auth.FIR_READ_PII) else {
+                **auth.redact_fir(payload), "related": payload["related"]}
     raise HTTPException(404, f"FIR {fir_number} not found")
 
 
@@ -412,17 +592,22 @@ def _related_firs(record: FIRRecord, result: AnalysisResult) -> list[dict]:
 async def get_repeat_offenders(
     risk_level: str | None = Query(None, pattern="^(critical|high|medium|low)$"),
     min_incidents: int = Query(2, ge=2, le=100),
+    user: auth.User = Depends(requires(auth.OFFENDER_READ)),
 ):
     result = _require_analysis()
     offenders = [o for o in result.repeat_offenders
                  if o.total_incidents >= min_incidents]
     if risk_level:
         offenders = [o for o in offenders if o.risk_level.value == risk_level]
-    return [_offender_payload(o) for o in offenders]
+    payloads = [_offender_payload(o) for o in offenders]
+    if not user.can(auth.FIR_READ_PII):
+        payloads = [auth.redact_offender(p) for p in payloads]
+    return payloads
 
 
 @app.get("/api/stations", tags=["analytics"])
-async def get_station_summaries():
+async def get_station_summaries(
+        user: auth.User = Depends(requires(auth.ANALYTICS_READ))):
     result = _require_analysis()
     payload = []
     for station in result.station_summaries:
@@ -437,18 +622,22 @@ async def get_station_summaries():
 
 
 @app.get("/api/networks", tags=["analytics"])
-async def get_crime_networks():
+async def get_crime_networks(
+        user: auth.User = Depends(requires(auth.ANALYTICS_READ))):
     _require_analysis()
     return networks_cache
 
 
 @app.get("/api/trends", tags=["analytics"])
-async def get_crime_trends():
+async def get_crime_trends(
+        user: auth.User = Depends(requires(auth.ANALYTICS_READ))):
     return _require_analysis().crime_trend
 
 
 @app.get("/api/crime-types/{crime_type}", tags=["analytics"])
-async def get_crime_type_detail(crime_type: str, sample: int = Query(8, ge=1, le=50)):
+async def get_crime_type_detail(
+        crime_type: str, sample: int = Query(8, ge=1, le=50),
+        user: auth.User = Depends(requires(auth.ANALYTICS_READ))):
     """Everything the dashboard needs to drill into one crime type.
 
     Backs the click-through on the crime distribution chart: selecting a slice
@@ -498,7 +687,12 @@ async def get_crime_type_detail(crime_type: str, sample: int = Query(8, ge=1, le
     ]
 
     top_severity = sorted(records, key=lambda r: -(r.severity_score or 0))[:sample]
+    show_pii = user.can(auth.FIR_READ_PII)
+    if not show_pii:
+        offenders = [auth.redact_offender({**o, "fir_count": o["total_incidents"]})
+                     for o in offenders]
     return {
+        "pii_redacted": not show_pii,
         "crime_type": crime_type,
         "label": crime_type.replace("_", " "),
         "total": len(records),
@@ -520,7 +714,8 @@ async def get_crime_type_detail(crime_type: str, sample: int = Query(8, ge=1, le
         "time_of_day": dict(times.most_common()),
         "repeat_offenders": offenders[:10],
         "networks": networks,
-        "top_firs": [_fir_payload(r) for r in top_severity],
+        "top_firs": [_fir_payload(r) if show_pii else auth.redact_fir(_fir_payload(r))
+                     for r in top_severity],
     }
 
 
@@ -556,7 +751,8 @@ def _sse(event: str, payload: dict) -> str:
 
 
 @app.post("/api/chat", response_model=ChatResponse, tags=["assistant"])
-async def chat_endpoint(req: ChatRequest):
+async def chat_endpoint(req: ChatRequest,
+                        user: auth.User = Depends(requires(auth.ASSISTANT_USE))):
     """Answer a question about the corpus (buffered).
 
     The deterministic answer is computed first and handed to the model as
@@ -595,7 +791,8 @@ async def chat_endpoint(req: ChatRequest):
 
 
 @app.post("/api/chat/stream", tags=["assistant"])
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest,
+                      user: auth.User = Depends(requires(auth.ASSISTANT_USE))):
     """Same as /api/chat, streamed token by token over SSE."""
     result = _require_analysis()
     message = (req.message or "").strip()
@@ -643,7 +840,9 @@ async def chat_stream(req: ChatRequest):
 
 
 @app.get("/api/report", tags=["assistant"])
-async def generate_report(focus: str = Query("", max_length=120)):
+async def generate_report(
+        focus: str = Query("", max_length=400),
+        user: auth.User = Depends(requires(auth.REPORT_GENERATE))):
     """Generate an intelligence report from the current analysis.
 
     Regenerated on every request — the corpus changes as FIRs are ingested, so
@@ -682,7 +881,9 @@ async def generate_report(focus: str = Query("", max_length=120)):
 
 
 @app.get("/api/report/stream", tags=["assistant"])
-async def report_stream(focus: str = Query("", max_length=120)):
+async def report_stream(
+        focus: str = Query("", max_length=400),
+        user: auth.User = Depends(requires(auth.REPORT_GENERATE))):
     """Stream the intelligence report as the model writes it."""
     result = _require_analysis()
     grounded = intel_qa.build_report(result, networks_cache)
@@ -712,7 +913,8 @@ async def report_stream(focus: str = Query("", max_length=120)):
 
 
 @app.post("/api/upload-firs", tags=["firs"])
-async def upload_firs(file: UploadFile = File(...)):
+async def upload_firs(file: UploadFile = File(...),
+                      user: auth.User = Depends(requires(auth.FIR_INGEST))):
     """Ingest a JSON array of FIR records and re-run the analysis."""
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:

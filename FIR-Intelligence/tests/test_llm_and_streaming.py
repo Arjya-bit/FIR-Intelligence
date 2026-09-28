@@ -15,12 +15,6 @@ import llm_client  # noqa: E402
 import main  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def client():
-    with TestClient(main.app) as test_client:
-        yield test_client
-
-
 def _mock_transport(handler):
     """Patch httpx.AsyncClient so llm_client talks to an in-process handler."""
     transport = httpx.MockTransport(handler)

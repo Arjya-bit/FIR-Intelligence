@@ -13,12 +13,6 @@ from fastapi.testclient import TestClient  # noqa: E402
 import main  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def client():
-    with TestClient(main.app) as test_client:
-        yield test_client
-
-
 class TestMeta:
     def test_health(self, client):
         body = client.get("/api/health").json()

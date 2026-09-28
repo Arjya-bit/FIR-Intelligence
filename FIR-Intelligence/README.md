@@ -90,10 +90,13 @@ This matters for a policing tool: a hallucinated offender is worse than "not in 
 Regenerated live on every request — the corpus changes as FIRs are ingested, so a cached
 report is stale the moment someone uploads a batch. Text streams in as the model writes it.
 
-Focus the briefing (repeat offenders, organised networks, resourcing, severity triage,
-cyber & fraud, narcotics) and the analysis and recommendations re-weight accordingly. The
-computed analysis is always returned alongside the prose, so you can see what the narrative
-was derived from.
+**Ask for the briefing you want.** Type the request in plain language — *"brief me on
+cross-district offenders in Lucknow and Kanpur for a task force"* — and the analysis and
+recommendations re-weight around it. Seven presets are one-click starting points you can
+edit rather than a fixed menu.
+
+The computed analysis is always returned alongside the prose, so you can see what the
+narrative was derived from.
 
 ## Drill-down
 
@@ -101,6 +104,48 @@ Selecting a segment of the crime distribution chart (or its keyboard-accessible 
 opens a breakdown of that offence: severity spread, districts, stations, sections invoked,
 modus operandi, weapons, monthly trend, the repeat offenders and networks involved, and the
 highest-severity FIRs. Selecting an FIR opens it in the FIR Records tab.
+
+## Signing in
+
+Access control is on by default. The first boot creates five demo accounts:
+
+| Username | Password | Role | Can do |
+|---|---|---|---|
+| `admin` | `Admin@FIR2024` | System Administrator | Everything, including account management |
+| `supervisor` | `Super@FIR2024` | Station Supervisor | Everything except managing accounts |
+| `investigator` | `Invest@FIR2024` | Investigating Officer | All analysis **plus accused/victim identities** |
+| `analyst` | `Analyst@FIR2024` | Crime Analyst | All analysis, identities **redacted** |
+| `viewer` | `Viewer@FIR2024` | Duty Officer | Dashboards only — no assistant, reports or ingestion |
+
+> **These passwords are published, so they are public.** The server prints a
+> warning while any are still in use. Change them from the **Account** tab, or
+> create your own accounts as `admin`, before this is reachable by anyone else.
+
+### How the roles differ
+
+Permissions guard endpoints; roles are just named permission sets, so a new role
+never requires touching a route.
+
+| Permission | viewer | analyst | investigator | supervisor | admin |
+|---|:--:|:--:|:--:|:--:|:--:|
+| `analytics:read` — dashboards, trends, networks | ● | ● | ● | ● | ● |
+| `fir:read` — FIR list and detail | ● | ● | ● | ● | ● |
+| `offender:read` — repeat offender profiles | | ● | ● | ● | ● |
+| `assistant:use` — the AI assistant | | ● | ● | ● | ● |
+| `report:generate` — intelligence reports | | ● | ● | ● | ● |
+| `fir:read_pii` — identities and FIR narratives | | | ● | ● | ● |
+| `fir:ingest` — upload FIR batches | | | | ● | ● |
+| `admin:users` — create and disable accounts | | | | | ● |
+
+**Redaction is real, not cosmetic.** Without `fir:read_pii` the server strips
+accused and victim names, addresses, parentage and the FIR narrative *before
+responding* — a lower role cannot recover them from the API, and offender
+profiles come back anonymised with the statistics intact. An analyst can study
+patterns without being handed everyone's personal data.
+
+Sessions are httpOnly, SameSite=Lax cookies signed with `FIR_SECRET_KEY`;
+passwords are PBKDF2-HMAC-SHA256 with a per-user salt; five failed attempts lock
+an account for five minutes.
 
 ## What it does
 
@@ -166,6 +211,12 @@ tests/               pytest suite
 | `GET /api/stations` | Station rollups with risk assessments |
 | `GET /api/networks` | Detected organised networks |
 | `GET /api/trends` | Month-by-crime-type series |
+| `POST /api/auth/login` | Sign in; sets the session cookie |
+| `POST /api/auth/logout` | Sign out |
+| `GET /api/auth/me` | Current user and permissions |
+| `GET /api/auth/roles` | Role catalogue (public — the login screen uses it) |
+| `GET /api/auth/users` | List accounts (`admin:users`) |
+| `POST /api/auth/users` | Create an account (`admin:users`) |
 | `GET /api/report` | Intelligence report + metadata — `focus` optional |
 | `GET /api/report/stream` | The same, streamed live over SSE |
 | `GET /api/crime-types/{type}` | Full breakdown of one crime type (chart drill-down) |
@@ -200,9 +251,11 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-148 tests cover identity resolution, entity extraction, the storage backend, the
+230 tests cover identity resolution, entity extraction, the storage backend, the
 deterministic answerer, the LLM client (request shape, streaming, every failure mode,
-prompt grounding), the SSE endpoints, the crime drill-down, and every HTTP endpoint
+prompt grounding), the SSE endpoints, the crime drill-down, the full role-permission
+matrix, PII redaction (including that a redacted record leaks the real name through no
+field at all), password hashing, session-token forgery and lockout, and every HTTP endpoint
 including error paths.
 
 To exercise the LLM paths without a key or outbound network access, a development stub of

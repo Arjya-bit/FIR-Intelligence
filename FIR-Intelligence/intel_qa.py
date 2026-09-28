@@ -221,9 +221,87 @@ def _answer_named_entity(result: AnalysisResult, networks: list[dict], question:
     return None
 
 
+_GREETINGS = {"hi", "hello", "hey", "yo", "hii", "helo", "namaste", "namaskar",
+              "good morning", "good afternoon", "good evening", "greetings",
+              "hi there", "hello there", "sup", "start"}
+_THANKS = {"thanks", "thank you", "thanks a lot", "ty", "cheers", "great",
+           "nice", "ok", "okay", "cool", "got it", "perfect", "good"}
+
+
+def _answer_conversational(result: AnalysisResult, networks, question) -> str | None:
+    """Reply to the thing actually said.
+
+    Without this, "hi" fell through to the default branch and returned a
+    statistics dump — which is exactly the canned-reply behaviour this module
+    exists to avoid, just pointed at the wrong prompt.
+    """
+    text = (question or "").strip().lower().rstrip("!?. ")
+    if not text:
+        return None
+
+    if text in _GREETINGS:
+        districts = len(_district_counts(result))
+        return (
+            f"Hello. I have {result.total_firs_processed} FIRs loaded from "
+            f"{districts} districts, with {len(result.repeat_offenders)} repeat "
+            f"offenders and {len(networks)} networks identified.\n\n"
+            "What would you like to look at? You can ask me about a district, a "
+            "crime type, a named accused, a specific FIR number, or ask which "
+            "cases are most urgent."
+        )
+
+    if text in _THANKS:
+        return "Happy to help. Ask me anything else about the corpus."
+
+    if text in {"bye", "goodbye", "exit", "quit"}:
+        return "Closing. The analysis stays loaded if you come back."
+
+    if any(phrase in text for phrase in
+           ("what can you do", "who are you", "what are you", "help me",
+            "how do you work", "what do you know", "capabilities", "/help")):
+        return (
+            "I answer questions about the FIR corpus currently loaded — "
+            f"{result.total_firs_processed} records analysed by the NLP "
+            "pipeline. I can:\n\n"
+            "- Summarise crime patterns, trends and severity\n"
+            "- Profile a named accused and list their linked FIRs\n"
+            "- Explain an organised network and who is in it\n"
+            "- Break down a district or a police station's caseload\n"
+            "- Open a specific FIR by number\n\n"
+            "Everything I say is computed from the analysed records — I will "
+            "tell you when something is not in the data rather than guess."
+        )
+    return None
+
+
+def _answer_unmatched(result: AnalysisResult, networks: list[dict], question: str) -> str:
+    """Say plainly that the question was not understood, and offer next steps.
+
+    Better than silently returning a statistics dump, which reads as though the
+    question was answered when it was not.
+    """
+    counts = _crime_counts(result)
+    districts = _district_counts(result)
+    asked = (question or "").strip()
+    preview = asked if len(asked) <= 90 else asked[:87] + "…"
+    return (
+        f'I could not match "{preview}" to anything in the analysed corpus.\n\n'
+        f"What I currently hold: {result.total_firs_processed} FIRs across "
+        f"{len(districts)} districts and {len(result.station_summaries)} "
+        f"stations, {len(result.repeat_offenders)} repeat offenders and "
+        f"{len(networks)} networks.\n\n"
+        "Try naming one of these:\n"
+        f"- a district, e.g. {', '.join(list(districts)[:3])}\n"
+        f"- a crime type, e.g. {', '.join(_pretty(c) for c in list(counts)[:3])}\n"
+        "- an accused person, an FIR number, or a police station\n"
+        "- or ask about patterns, networks, severity or repeat offenders"
+    )
+
+
 #: Ordered intent table. Specific lookups run before broad summaries so
 #: "who is Bablu" is not swallowed by the repeat-offender overview.
 _INTENTS = [
+    (None, _answer_conversational),
     (None, _answer_named_entity),
     (("repeat offender", "habitual", "serial", "who are the offenders",
       "wanted", "accused list"), _answer_offenders),
@@ -252,21 +330,7 @@ def answer_question(question: str, result: AnalysisResult,
             if answer:
                 return answer
 
-    counts = _crime_counts(result)
-    districts = _district_counts(result)
-    return (
-        f"Current corpus: {result.total_firs_processed} FIRs across "
-        f"{len(districts)} districts and {len(result.station_summaries)} stations.\n"
-        f"- {len(result.repeat_offenders)} repeat offenders flagged\n"
-        f"- {len(networks)} organised networks detected\n"
-        f"- Most common offence: "
-        f"{_pretty(counts.most_common(1)[0][0]) if counts else 'n/a'}"
-        f"{f' ({counts.most_common(1)[0][1]} FIRs)' if counts else ''}\n"
-        f"- Busiest district: "
-        f"{districts.most_common(1)[0][0] if districts else 'n/a'}\n\n"
-        "Ask about repeat offenders, networks, districts, stations, severity, "
-        "a specific FIR number, or a named accused."
-    )
+    return _answer_unmatched(result, networks, question)
 
 
 def build_report(result: AnalysisResult, networks: list[dict] | None = None) -> str:
